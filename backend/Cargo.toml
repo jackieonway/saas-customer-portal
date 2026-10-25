@@ -1,0 +1,30 @@
+[package]
+name = "saas-customer-portal-backend"
+version = "1.0.0"
+edition = "2021"
+description = "Independent CUSTOMER-only OIDC BFF and self-profile portal"
+
+[dependencies]
+anyhow = "=1.0.104"
+axum = "=0.8.9"
+base64 = "=0.22.1"
+chrono = { version = "=0.4.45", features = ["serde"] }
+hex = "=0.4.3"
+jsonwebtoken = "=9.3.1"
+percent-encoding = "=2.3.2"
+rand = "=0.8.8"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+ring = "=0.17.14"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "macros", "derive", "json"] }
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+uuid = { version = "=1.26.1", features = ["v7", "serde"] }
+
+[dev-dependencies]
+tower = { version = "=0.5.3", features = ["util"] }
+
+[profile.dev]
+debug = 1
