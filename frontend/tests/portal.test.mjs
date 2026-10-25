@@ -219,6 +219,342 @@ test('401 during self-profile proof clears every identity and waits for explicit
   assert.equal(calls.bootstrap, 0)
 })
 
+for (const status of [401, 409]) {
+  test(`profile proof reconciliation reads the latest cross-tab identity once after ${status}`, async () => {
+    const original = session()
+    const switched = session({
+      version: '2',
+      memberships: [member(), member({ membershipId: ids.otherMember, organizationId: ids.otherOrg })],
+      context: { ...original.context, membershipId: ids.otherMember, organization: { id: ids.otherOrg, name: '另一个客户组织' } },
+    })
+    const requests = [], published = []
+    let sessionCalls = 0, profileCalls = 0
+    const api = createApi(async (path, init) => {
+      requests.push({ path, method: init.method })
+      if (path === '/auth/config') return json({ mode: 'BFF' })
+      if (path === '/auth/session') return json(++sessionCalls === 1 ? original : switched)
+      if (path === '/api/profile') return ++profileCalls === 1 ? json({}, status) : json(profile(switched))
+      throw new Error('Unexpected mutation during read reconciliation')
+    })
+    const controller = new PortalController(api, { navigate: () => assert.fail('No automatic navigation'), broadcast: () => assert.fail('No read broadcast') })
+    controller.subscribe(() => published.push(controller.getSnapshot()))
+    await controller.reload()
+    assert.equal(controller.getSnapshot().status, 'ready')
+    assert.equal(controller.getSnapshot().session.version, '2')
+    assert.equal(controller.getSnapshot().profile.context.membershipId, ids.otherMember)
+    assert.deepEqual(requests, ['/auth/config', '/auth/session', '/api/profile', '/auth/session', '/api/profile'].map((path) => ({ path, method: 'GET' })))
+    assert.equal(published.some((state) => state.profile?.context.membershipId === ids.member), false)
+  })
+}
+
+test('profile proof reconciliation also handles a rotated server capability with an unchanged public version', async () => {
+  let sessionCalls = 0, profileCalls = 0
+  const { controller, calls } = harness({
+    session: async () => { sessionCalls += 1; return session() },
+    profile: async (value) => { if (++profileCalls === 1) throw new HttpError(401); return profile(value) },
+  })
+  await controller.reload()
+  assert.equal(controller.getSnapshot().status, 'ready')
+  assert.equal(sessionCalls, 2)
+  assert.equal(profileCalls, 2)
+  assert.equal(controller.getSnapshot().session.version, '1')
+  assert.deepEqual(calls.selection, [])
+  assert.deepEqual(calls.logout, [])
+  assert.equal(calls.login, 0)
+})
+
+test('profile proof reconciliation is bounded and persistent invalid credentials stay signed out', async () => {
+  for (const failureAt of ['session', 'profile']) {
+    let sessionCalls = 0, profileCalls = 0
+    const { controller, calls } = harness({
+      session: async () => { if (++sessionCalls === 2 && failureAt === 'session') throw new HttpError(401); return session() },
+      profile: async () => { profileCalls += 1; throw new HttpError(401) },
+    })
+    await controller.reload()
+    assert.equal(controller.getSnapshot().status, 'signed-out')
+    assert.equal(controller.getSnapshot().profile, null)
+    assert.equal(controller.getSnapshot().session, null)
+    assert.equal(sessionCalls, 2)
+    assert.equal(profileCalls, failureAt === 'session' ? 1 : 2)
+    assert.equal(calls.login, 0)
+    assert.equal(calls.bootstrap, 0)
+    assert.deepEqual(calls.selection, [])
+    assert.deepEqual(calls.logout, [])
+  }
+})
+
+test('profile proof reconciliation never retries dependency failures, forbidden access, or malformed proof', async () => {
+  for (const error of [new HttpError(403), new HttpError(503), new ProtocolError()]) {
+    let sessionCalls = 0, profileCalls = 0
+    const { controller } = harness({
+      session: async () => { sessionCalls += 1; return session() },
+      profile: async () => { profileCalls += 1; throw error },
+    })
+    await controller.reload()
+    assert.equal(sessionCalls, 1)
+    assert.equal(profileCalls, 1)
+    assert.equal(controller.getSnapshot().profile, null)
+    assert.equal(controller.getSnapshot().session, null)
+    assert.equal(controller.getSnapshot().status, error instanceof HttpError ? error.status === 403 ? 'forbidden' : 'unavailable' : 'error')
+  }
+})
+
+test('profile proof reconciliation cannot republish data after a newer logout or hidden-page fence', async () => {
+  const entered = deferred(), pending = deferred()
+  let sessionCalls = 0, reconciliationSignal
+  const { controller } = harness({
+    session: async (signal) => {
+      if (++sessionCalls === 2) { reconciliationSignal = signal; entered.resolve(); return pending.promise }
+      return sessionCalls === 1 ? session() : anonymous()
+    },
+    profile: async () => { throw new HttpError(401) },
+  })
+  const older = controller.reload()
+  await entered.promise
+  assert.equal(controller.getSnapshot().profile, null)
+  controller.suspend()
+  assert.equal(reconciliationSignal.aborted, true)
+  await controller.reload()
+  pending.resolve(session({ version: '2' }))
+  await older
+  assert.equal(controller.getSnapshot().status, 'signed-out')
+  assert.equal(controller.getSnapshot().profile, null)
+  assert.equal(controller.getSnapshot().session.account, null)
+})
+
+test('profile proof reconciliation after explicit selection does not replay the mutation', async () => {
+  let sessionCalls = 0, profileCalls = 0
+  const selected = session({ version: '2' })
+  const { controller, api, calls } = harness({
+    session: async () => ++sessionCalls === 1 ? session({ context: null }) : selected,
+    profile: async (value) => { if (++profileCalls === 1) throw new HttpError(401); return profile(value) },
+  })
+  api.select = async (_value, membershipId) => { calls.selection.push(membershipId); return selected }
+  await controller.reload()
+  await controller.select(ids.member)
+  assert.equal(controller.getSnapshot().status, 'ready')
+  assert.equal(controller.getSnapshot().session.version, '2')
+  assert.deepEqual(calls.selection, [ids.member])
+  assert.deepEqual(calls.broadcast, [CHANGE_MESSAGE])
+  assert.equal(calls.login, 0)
+  assert.deepEqual(calls.logout, [])
+})
+
+for (const status of [401, 409]) {
+  test(`bounded profile reconciliation waits through a session lease after profile ${status}`, async () => {
+    const original = session()
+    const membership = member({ membershipId: ids.otherMember, organizationId: ids.otherOrg })
+    const switched = session({ version: '2', memberships: [membership], context: { ...original.context, membershipId: ids.otherMember, organization: { id: ids.otherOrg, name: membership.organizationName } } })
+    const requests = [], published = []
+    let sessionCalls = 0, profileCalls = 0
+    const api = createApi(async (path, init) => {
+      requests.push({ path, method: init.method })
+      if (path === '/auth/config') return json({ mode: 'BFF' })
+      if (path === '/auth/session') {
+        sessionCalls += 1
+        return sessionCalls === 1 ? json(original) : sessionCalls === 2 ? json({}, 503) : json(switched)
+      }
+      if (path === '/api/profile') return ++profileCalls === 1 ? json({}, status) : json(profile(switched))
+      throw new Error('Unexpected mutation during read reconciliation')
+    })
+    const controller = new PortalController(api, { navigate: () => assert.fail('No automatic navigation'), broadcast: () => assert.fail('No read broadcast') })
+    controller.subscribe(() => published.push(controller.getSnapshot()))
+    await controller.reload()
+    assert.equal(controller.getSnapshot().status, 'ready')
+    assert.equal(controller.getSnapshot().session.version, '2')
+    assert.equal(controller.getSnapshot().profile.context.membershipId, ids.otherMember)
+    assert.deepEqual(requests, ['/auth/config', '/auth/session', '/api/profile', '/auth/session', '/auth/session', '/api/profile'].map((path) => ({ path, method: 'GET' })))
+    assert.equal(published.some((state) => state.profile?.context.membershipId === ids.member), false)
+  })
+}
+
+test('bounded profile reconciliation permits only three authority reads before a fresh bound profile', async () => {
+  let sessionCalls = 0, profileCalls = 0
+  const { controller, calls } = harness({
+    session: async () => {
+      sessionCalls += 1
+      if (sessionCalls === 2 || sessionCalls === 3) throw new HttpError(503)
+      return session({ version: sessionCalls === 1 ? '1' : '2' })
+    },
+    profile: async (value) => { if (++profileCalls === 1) throw new HttpError(409); return profile(value) },
+  })
+  await controller.reload()
+  assert.equal(controller.getSnapshot().status, 'ready')
+  assert.equal(controller.getSnapshot().session.version, '2')
+  assert.equal(sessionCalls, 4)
+  assert.equal(profileCalls, 2)
+  assert.equal(calls.login, 0)
+  assert.equal(calls.bootstrap, 0)
+  assert.deepEqual(calls.selection, [])
+  assert.deepEqual(calls.logout, [])
+})
+
+test('bounded profile reconciliation fails closed after persistent authority 503 and removes old data', async () => {
+  let sessionCalls = 0, reconciling = false
+  const published = []
+  const { controller, calls } = harness({
+    session: async () => { sessionCalls += 1; if (reconciling && sessionCalls > 2) throw new HttpError(503); return session() },
+    profile: async (value) => { if (reconciling) throw new HttpError(401); return profile(value) },
+  })
+  await controller.reload()
+  assert.equal(controller.getSnapshot().status, 'ready')
+  controller.subscribe(() => published.push(controller.getSnapshot()))
+  reconciling = true
+  await controller.reload()
+  assert.equal(controller.getSnapshot().status, 'unavailable')
+  assert.equal(controller.getSnapshot().session, null)
+  assert.equal(controller.getSnapshot().profile, null)
+  assert.equal(sessionCalls, 5)
+  assert.equal(published.every((state) => state.session === null && state.profile === null), true)
+  assert.equal(calls.login, 0)
+  assert.equal(calls.bootstrap, 0)
+  assert.deepEqual(calls.selection, [])
+  assert.deepEqual(calls.logout, [])
+  assert.deepEqual(calls.broadcast, [])
+  assert.deepEqual(calls.navigation, [])
+})
+
+test('bounded profile reconciliation does not retry ordinary initial session 503', async () => {
+  let sessionCalls = 0
+  const { controller, calls } = harness({ session: async () => { sessionCalls += 1; throw new HttpError(503) } })
+  await controller.reload()
+  assert.equal(controller.getSnapshot().status, 'unavailable')
+  assert.equal(sessionCalls, 1)
+  assert.equal(calls.profile, 0)
+  assert.equal(calls.login, 0)
+  assert.equal(calls.bootstrap, 0)
+})
+
+test('bounded profile reconciliation never retries other authority errors or a second profile failure', async () => {
+  for (const failureAt of ['session', 'profile']) {
+    for (const error of [new HttpError(401), new HttpError(403), new HttpError(409), new HttpError(503), new ProtocolError()]) {
+      if (failureAt === 'session' && error instanceof HttpError && error.status === 503) continue
+      let sessionCalls = 0, profileCalls = 0
+      const { controller } = harness({
+        session: async () => { if (++sessionCalls > 1 && failureAt === 'session') throw error; return session() },
+        profile: async () => { if (++profileCalls === 1) throw new HttpError(401); throw error },
+      })
+      await controller.reload()
+      assert.equal(sessionCalls, 2)
+      assert.equal(profileCalls, failureAt === 'session' ? 1 : 2)
+      assert.equal(controller.getSnapshot().profile, null)
+      assert.equal(controller.getSnapshot().session, null)
+      assert.equal(controller.getSnapshot().status, error instanceof HttpError ? error.status === 401 ? 'signed-out' : error.status === 403 ? 'forbidden' : error.status === 503 ? 'unavailable' : 'error' : 'error')
+    }
+  }
+})
+
+test('bounded profile reconciliation dispatches no retry after a slow authority failure exhausts its budget', async (t) => {
+  let now = 0, sessionCalls = 0, profileCalls = 0
+  t.mock.method(globalThis.performance, 'now', () => now)
+  const { controller } = harness({
+    session: async () => { if (++sessionCalls > 1) { now = 500; throw new HttpError(503) } return session() },
+    profile: async () => { profileCalls += 1; throw new HttpError(401) },
+  })
+  await controller.reload()
+  assert.equal(sessionCalls, 2)
+  assert.equal(profileCalls, 1)
+  assert.equal(controller.getSnapshot().status, 'unavailable')
+  assert.equal(controller.getSnapshot().profile, null)
+})
+
+test('bounded profile reconciliation dispatches no request when its backoff reaches the deadline', async (t) => {
+  let now = 0, sessionCalls = 0, profileCalls = 0
+  const delays = []
+  const realSetTimeout = globalThis.setTimeout
+  t.mock.method(globalThis.performance, 'now', () => now)
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
+    delays.push(delay)
+    return realSetTimeout(() => { now = 500; callback() }, 0)
+  })
+  const { controller } = harness({
+    session: async () => { if (++sessionCalls > 1) { now = 450; throw new HttpError(503) } return session() },
+    profile: async () => { profileCalls += 1; throw new HttpError(401) },
+  })
+  await controller.reload()
+  assert.deepEqual(delays, [50])
+  assert.equal(sessionCalls, 2)
+  assert.equal(profileCalls, 1)
+  assert.equal(controller.getSnapshot().status, 'unavailable')
+})
+
+test('bounded profile reconciliation never dispatches a profile for authority material arriving after its budget', async (t) => {
+  let now = 0, sessionCalls = 0, profileCalls = 0
+  t.mock.method(globalThis.performance, 'now', () => now)
+  const { controller } = harness({
+    session: async () => { if (++sessionCalls > 1) now = 500; return session() },
+    profile: async (value) => { if (++profileCalls === 1) throw new HttpError(401); return profile(value) },
+  })
+  await controller.reload()
+  assert.equal(sessionCalls, 2)
+  assert.equal(profileCalls, 1)
+  assert.equal(controller.getSnapshot().status, 'unavailable')
+  assert.equal(controller.getSnapshot().session, null)
+  assert.equal(controller.getSnapshot().profile, null)
+})
+
+test('bounded profile reconciliation aborts its wait without a later authority dispatch', async (t) => {
+  const waiting = deferred()
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  let sessionCalls = 0, reconciliationSignal, cleared = 0
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => { waiting.resolve(delay); return realSetTimeout(callback, delay) })
+  t.mock.method(globalThis, 'clearTimeout', (timer) => { cleared += 1; return realClearTimeout(timer) })
+  const { controller } = harness({
+    session: async (signal) => { if (++sessionCalls > 1) { reconciliationSignal = signal; throw new HttpError(503) } return session() },
+    profile: async () => { throw new HttpError(401) },
+  })
+  const operation = controller.reload()
+  assert.equal(await waiting.promise, 100)
+  controller.suspend()
+  await operation
+  assert.equal(reconciliationSignal.aborted, true)
+  assert.equal(cleared, 1)
+  assert.equal(sessionCalls, 2)
+  assert.equal(controller.getSnapshot().status, 'loading')
+  assert.equal(controller.getSnapshot().profile, null)
+})
+
+test('bounded profile reconciliation yields to a newer anonymous epoch during its wait', async (t) => {
+  const waiting = deferred()
+  const realSetTimeout = globalThis.setTimeout
+  let sessionCalls = 0, profileCalls = 0
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => { waiting.resolve(); return realSetTimeout(callback, delay) })
+  const { controller } = harness({
+    session: async () => { if (++sessionCalls === 2) throw new HttpError(503); return sessionCalls === 1 ? session() : anonymous() },
+    profile: async () => { profileCalls += 1; throw new HttpError(401) },
+  })
+  const older = controller.reload()
+  await waiting.promise
+  await controller.reload()
+  await older
+  assert.equal(sessionCalls, 3)
+  assert.equal(profileCalls, 1)
+  assert.equal(controller.getSnapshot().status, 'signed-out')
+  assert.equal(controller.getSnapshot().session.account, null)
+  assert.equal(controller.getSnapshot().profile, null)
+})
+
+test('bounded profile reconciliation after explicit selection never replays the mutation', async () => {
+  let sessionCalls = 0, profileCalls = 0
+  const selected = session({ version: '2' })
+  const { controller, api, calls } = harness({
+    session: async () => { if (++sessionCalls === 2) throw new HttpError(503); return sessionCalls === 1 ? session({ context: null }) : selected },
+    profile: async (value) => { if (++profileCalls === 1) throw new HttpError(401); return profile(value) },
+  })
+  api.select = async (_value, membershipId) => { calls.selection.push(membershipId); return selected }
+  await controller.reload()
+  await controller.select(ids.member)
+  assert.equal(controller.getSnapshot().status, 'ready')
+  assert.equal(controller.getSnapshot().session.version, '2')
+  assert.equal(sessionCalls, 3)
+  assert.deepEqual(calls.selection, [ids.member])
+  assert.deepEqual(calls.broadcast, [CHANGE_MESSAGE])
+  assert.deepEqual(calls.logout, [])
+  assert.equal(calls.login, 0)
+  assert.equal(calls.bootstrap, 0)
+})
+
 test('503 suspends personal data and supports an explicit successful retry', async () => {
   let unavailable = true
   const { controller } = harness({ profile: async () => {

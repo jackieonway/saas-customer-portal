@@ -2,7 +2,7 @@
 
 独立的客户登录入口与本人资料页面。客户门户通过同一认证中心完成 OIDC 登录，只选择已存在且有效的 `CUSTOMER` 成员；员工控制台继续使用自己的员工客户端与会话。
 
-平台身份台账 [Phase 11](../saas-plateform/backend/docs/identity-sso/validation/phase-11.md)已完成，真实 Rust／前端门禁、双 RP 登录／刷新／注销、双向成员撤销和故障恢复均通过；[Phase 12](../saas-plateform/backend/docs/identity-sso/validation/phase-12.md)已完成独立认证部署与同库权限治理。当前 [Phase 13](../saas-plateform/backend/docs/identity-sso/validation/phase-13.md)仍为 IN_PROGRESS，完整容量、灰度、身份感知恢复与最终运维验收尚未完成，生产默认开关仍关闭。本工程不提供客户自助注册、角色菜单、订单、工单或客户通知，不复制管理宿主。生产域名、维护人、切流和运维承诺需按实际部署登记。
+平台身份台账 [Phase 11](../saas-plateform/backend/docs/identity-sso/validation/phase-11.md)已完成，真实 Rust／前端门禁、双 RP 登录／刷新／注销、双向成员撤销和故障恢复均通过；[Phase 12](../saas-plateform/backend/docs/identity-sso/validation/phase-12.md)已完成独立认证部署与同库权限治理。[Phase 13](../saas-plateform/backend/docs/identity-sso/validation/phase-13.md)的任务容量、灰度、身份感知恢复与运维验收已完成，身份台账13个阶段均为 COMPLETED；按用户要求分轮复用已通过项，仅补测失败项，各轮与UI版本分别记证。门户只读核对竞态修复通过55项前端测试与343项初始浏览器检查；恢复浏览器247项属于此前已通过版本，未在当前UI重复执行。生产默认开关仍关闭。本工程不提供客户自助注册、角色菜单、订单、工单或客户通知，不复制管理宿主。生产域名、维护人、切流和运维承诺需按实际部署登记。
 
 | 目录 | 职责 |
 | --- | --- |

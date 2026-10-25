@@ -18,6 +18,8 @@ interface Effects {
 }
 
 const initialState: PortalState = { status: 'loading', session: null, profile: null, busy: true }
+const reconciliationBudgetMs = 500
+const reconciliationDelaysMs = [100, 200]
 
 /** Each new operation clears personal data before it begins; stale responses cannot republish it. */
 export class PortalController {
@@ -69,13 +71,65 @@ export class PortalController {
     this.publish({ status, session: null, profile: null, busy: false })
   }
 
-  private async accept(session: PortalSession, epoch: number, signal: AbortSignal): Promise<void> {
+  private waitForReconciliation(delay: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      const finish = (): void => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      const timer = setTimeout(finish, delay)
+      signal.addEventListener('abort', finish, { once: true })
+      if (signal.aborted) finish()
+    })
+  }
+
+  private async reconcile(epoch: number, signal: AbortSignal): Promise<void> {
+    const deadline = performance.now() + reconciliationBudgetMs
+    for (let attempt = 0; attempt <= reconciliationDelaysMs.length; attempt += 1) {
+      if (!this.current(epoch) || signal.aborted) return
+      if (performance.now() >= deadline) throw new HttpError(503)
+      let session: PortalSession
+      try {
+        session = await this.api.session(signal)
+      } catch (error) {
+        if (!this.current(epoch) || signal.aborted) return
+        if (!(error instanceof HttpError) || error.status !== 503 || attempt === reconciliationDelaysMs.length) throw error
+        const remaining = deadline - performance.now()
+        if (remaining <= 0) throw error
+        // A context/refresh lease may still be settling. Only this read has a
+        // short, cancellable retry budget; no mutation or refresh is replayed.
+        await this.waitForReconciliation(Math.min(reconciliationDelaysMs[attempt], remaining), signal)
+        continue
+      }
+      if (!this.current(epoch) || signal.aborted) return
+      // The budget bounds dispatch, including the subsequent strict profile read.
+      if (performance.now() >= deadline) throw new HttpError(503)
+      await this.accept(session, epoch, signal, false)
+      return
+    }
+  }
+
+  private async accept(session: PortalSession, epoch: number, signal: AbortSignal, reconcileProfile = true): Promise<void> {
     if (!this.current(epoch)) return
     if (session.account === null || this.signedOutLanding) {
       this.publish({ status: 'signed-out', session, profile: null, busy: false })
       return
     }
-    const profile = session.context === null ? null : await this.api.profile(session, signal)
+    let profile: Profile | null = null
+    if (session.context !== null) {
+      try {
+        profile = await this.api.profile(session, signal)
+      } catch (error) {
+        if (!this.current(epoch)) return
+        // Session and profile are separate reads. A tab switch or server-side
+        // capability rotation may invalidate the first snapshot without logout.
+        // Reconcile from authority with a bounded lease wait; never replay a write.
+        if (!reconcileProfile || !(error instanceof HttpError) || (error.status !== 401 && error.status !== 409)) throw error
+        await this.reconcile(epoch, signal)
+        return
+      }
+    }
     if (!this.current(epoch)) return
     this.publish({ status: 'ready', session, profile, busy: false })
   }
