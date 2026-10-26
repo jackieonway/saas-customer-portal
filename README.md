@@ -1,14 +1,11 @@
 # 客户门户
 
-独立的客户登录入口与本人资料页面。客户门户通过同一认证中心完成 OIDC 登录，只选择已存在且有效的 `CUSTOMER` 成员；员工控制台继续使用自己的员工客户端与会话。
+独立客户 OIDC BFF 与本人资料入口。客户在同一认证中心登录后，只选择真实有效的 CUSTOMER 成员；员工控制台继续使用自己的员工 RP 与会话。
 
-平台身份台账 [Phase 11](../saas-plateform/backend/docs/identity-sso/validation/phase-11.md)已完成，真实 Rust／前端门禁、双 RP 登录／刷新／注销、双向成员撤销和故障恢复均通过；[Phase 12](../saas-plateform/backend/docs/identity-sso/validation/phase-12.md)已完成独立认证部署与同库权限治理。[Phase 13](../saas-plateform/backend/docs/identity-sso/validation/phase-13.md)的任务容量、灰度、身份感知恢复与运维验收已完成，身份台账13个阶段均为 COMPLETED；按用户要求分轮复用已通过项，仅补测失败项，各轮与UI版本分别记证。门户只读核对竞态修复通过55项前端测试与343项初始浏览器检查；恢复浏览器247项属于此前已通过版本，未在当前UI重复执行。生产默认开关仍关闭。本工程不提供客户自助注册、角色菜单、订单、工单或客户通知，不复制管理宿主。生产域名、维护人、切流和运维承诺需按实际部署登记。
+后端在独立 PostgreSQL 数据库执行 `backend/migrations/0001_customer_portal.sql`，服务端加密保存上游凭据。浏览器只持有 HttpOnly Cookie、最小 DTO 与内存 CSRF，不保存 OIDC access/refresh 或派生资源 token。
 
-| 目录 | 职责 |
-| --- | --- |
-| `backend` | Rust/Axum BFF，独立 PostgreSQL 会话与加密凭据存储，标准 OIDC 客户端及平台资源 HTTP 适配 |
-| `frontend` | React/Vite 客户身份选择、当前组织与本人资料，凭据仅由 HttpOnly Cookie 承载 |
+门户 RP secret 仅用于认证中心；平台本人资料调用使用独立登记的 profile 客户端。两个入口的 Cookie、版本和跨标签页命名空间独立，成员与账号撤销按原始证明实时生效。
 
-门户自己的 OIDC RP secret 仅用于认证中心端点；平台资源调用使用独立登记的 profile 客户端。OIDC token、refresh 和派生客户 context 留在服务器，浏览器只接收最少账号／客户 DTO 和内存 CSRF。两个入口使用独立 Cookie、版本和跨标签页协调命名空间。
+本系统提供登录、客户身份选择、当前组织与本人资料，不提供自助注册、员工角色菜单或完整业务后台。HTTPS origin、精确 callback、CA、外部密钥和独立数据库账号由实际部署配置。
 
-各目录可以独立安装、检查和构建；运行配置与接口见目录内 README。部署时使用明确 HTTPS origin、精确 callback、外部密钥文件和独立数据库账号。示例 `.test` 域名仅供任务隔离验证。
+[backend](backend/README.md)与[frontend](frontend/README.md)独立安装、检查与构建。新数据库与平台/身份的归属见[全新安装](../saas-plateform/backend/docs/fresh-installation.md)。旧阶段验收与历史环境数据不作为当前部署配置。

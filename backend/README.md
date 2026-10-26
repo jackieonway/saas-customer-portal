@@ -89,7 +89,7 @@ rejects unknown fields.
 | `POST /auth/login` | `{returnTo:'/'}` plus bootstrap CSRF → `{redirectTo:<fixed-issuer authorize URL>}` |
 | `GET /auth/callback` | Issuer, state, independent login binder and browser generation; consumes the flow once, validates the full code exchange, then redirects to the checked local path |
 | `POST /auth/context` | `{expectedVersion,membershipId}` → fresh `portal-session/1`; organization and identity version come only from authenticated server candidates |
-| `GET /api/profile` | Exactly Phase 6 `{context,account}`, including only the selected CUSTOMER membership and four account presentation fields |
+| `GET /api/profile` | Exactly the current resource contract `{context,account}`, including only the selected CUSTOMER membership and four account presentation fields |
 | `POST /auth/logout` | `{expectedVersion,scope:'PORTAL'|'GLOBAL'}` → `{redirectTo:'/signed-out'}` after the durable original command is confirmed |
 
 Authenticated session snapshots contain `contractVersion`, `version`,
@@ -165,5 +165,5 @@ It verifies UUID/schema isolation, both post-write cross-tab snapshot races,
 unknown refresh no-replay, and explicit login bootstrap after an invalid old
 cookie. Tests use deterministic boundaries rather than timing sleeps. Actual
 shared-SSO/customer-only/profile/revocation browser acceptance is recorded by
-the platform identity Phase 11 validation evidence; compiling these tests does
+the current deployment validation report; compiling these tests does
 not itself claim that end-to-end acceptance.

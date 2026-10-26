@@ -1,59 +1,148 @@
--- This database contains only the portal RP's persistence. No account/member
--- authority or platform business table is mirrored into it.
+-- Fresh installation baseline. Existing installations must be recreated; no historical adoption.
+-- PostgreSQL 17+, application-generated UUIDv7, SSO-only console.
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+
 CREATE FUNCTION public.is_uuid_v7(value uuid) RETURNS boolean
-LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path=pg_catalog AS $$
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    SET search_path TO 'pg_catalog'
+    AS $$
  SELECT (get_byte(uuid_send(value),6)>>4)=7 AND (get_byte(uuid_send(value),8)&192)=128
 $$;
-CREATE TABLE portal_browsers (
- id uuid PRIMARY KEY CHECK(public.is_uuid_v7(id)),
- token_hash text NOT NULL UNIQUE CHECK(token_hash ~ '^[0-9a-f]{64}$'),
- generation bigint NOT NULL CHECK(generation>=0),
- current_session_id uuid CHECK(current_session_id IS NULL OR public.is_uuid_v7(current_session_id)),
- created_at timestamptz NOT NULL,expires_at timestamptz NOT NULL CHECK(expires_at>created_at)
+
+SET default_table_access_method = heap;
+
+CREATE TABLE public.portal_browsers (
+    id uuid NOT NULL,
+    token_hash text NOT NULL,
+    generation bigint NOT NULL,
+    current_session_id uuid,
+    created_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT portal_browsers_check CHECK ((expires_at > created_at)),
+    CONSTRAINT portal_browsers_current_session_id_check CHECK (((current_session_id IS NULL) OR public.is_uuid_v7(current_session_id))),
+    CONSTRAINT portal_browsers_generation_check CHECK ((generation >= 0)),
+    CONSTRAINT portal_browsers_id_check CHECK (public.is_uuid_v7(id)),
+    CONSTRAINT portal_browsers_token_hash_check CHECK ((token_hash ~ '^[0-9a-f]{64}$'::text))
 );
-CREATE TABLE portal_login_flows (
- id uuid PRIMARY KEY CHECK(public.is_uuid_v7(id)),
- browser_id uuid NOT NULL REFERENCES portal_browsers(id) CHECK(public.is_uuid_v7(browser_id)),
- browser_generation bigint NOT NULL CHECK(browser_generation>=0),
- state_hash text NOT NULL UNIQUE CHECK(state_hash ~ '^[0-9a-f]{64}$'),
- binder_hash text NOT NULL CHECK(binder_hash ~ '^[0-9a-f]{64}$'),
- nonce_hash text NOT NULL CHECK(nonce_hash ~ '^[0-9a-f]{64}$'),
- verifier_ciphertext text NOT NULL,return_path text NOT NULL,
- created_at timestamptz NOT NULL,expires_at timestamptz NOT NULL CHECK(expires_at>created_at),consumed_at timestamptz
+
+CREATE TABLE public.portal_login_flows (
+    id uuid NOT NULL,
+    browser_id uuid NOT NULL,
+    browser_generation bigint NOT NULL,
+    state_hash text NOT NULL,
+    binder_hash text NOT NULL,
+    nonce_hash text NOT NULL,
+    verifier_ciphertext text NOT NULL,
+    return_path text NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    CONSTRAINT portal_login_flows_binder_hash_check CHECK ((binder_hash ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT portal_login_flows_browser_generation_check CHECK ((browser_generation >= 0)),
+    CONSTRAINT portal_login_flows_browser_id_check CHECK (public.is_uuid_v7(browser_id)),
+    CONSTRAINT portal_login_flows_check CHECK ((expires_at > created_at)),
+    CONSTRAINT portal_login_flows_id_check CHECK (public.is_uuid_v7(id)),
+    CONSTRAINT portal_login_flows_nonce_hash_check CHECK ((nonce_hash ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT portal_login_flows_state_hash_check CHECK ((state_hash ~ '^[0-9a-f]{64}$'::text))
 );
-CREATE INDEX portal_login_flows_expiry ON portal_login_flows(expires_at);
-CREATE TABLE portal_sessions (
- id uuid PRIMARY KEY CHECK(public.is_uuid_v7(id)),
- browser_id uuid NOT NULL REFERENCES portal_browsers(id) CHECK(public.is_uuid_v7(browser_id)),
- token_hash text NOT NULL UNIQUE CHECK(token_hash ~ '^[0-9a-f]{64}$'),
- user_id uuid NOT NULL CHECK(public.is_uuid_v7(user_id)),
- account_version bigint NOT NULL CHECK(account_version>=0),
- global_session_id uuid NOT NULL CHECK(public.is_uuid_v7(global_session_id)),
- oidc_client_id uuid NOT NULL CHECK(public.is_uuid_v7(oidc_client_id)),
- oidc_grant_id uuid NOT NULL CHECK(public.is_uuid_v7(oidc_grant_id)),
- oidc_client_policy_version bigint NOT NULL CHECK(oidc_client_policy_version>=1),
- issuer text NOT NULL,auth_time bigint NOT NULL CHECK(auth_time>0),
- nonce_hash text NOT NULL CHECK(nonce_hash ~ '^[0-9a-f]{64}$'),
- access_ciphertext text NOT NULL,refresh_ciphertext text NOT NULL,access_expires_at timestamptz NOT NULL,
- version bigint NOT NULL CHECK(version>=1),
- membership_id uuid CHECK(membership_id IS NULL OR public.is_uuid_v7(membership_id)),
- organization_id uuid CHECK(organization_id IS NULL OR public.is_uuid_v7(organization_id)),
- identity_version bigint CHECK(identity_version IS NULL OR identity_version>=1),
- customer_ciphertext text,customer_expires_at timestamptz,customer_needs_renewal boolean NOT NULL DEFAULT false,
- refresh_lease_id uuid CHECK(refresh_lease_id IS NULL OR public.is_uuid_v7(refresh_lease_id)),
- refresh_started_at timestamptz,refresh_uncertain boolean NOT NULL DEFAULT false,
- context_lease_id uuid CHECK(context_lease_id IS NULL OR public.is_uuid_v7(context_lease_id)),
- context_started_at timestamptz,
- logout_request_id uuid CHECK(logout_request_id IS NULL OR public.is_uuid_v7(logout_request_id)),
- logout_scope text CHECK(logout_scope IN ('GLOBAL','PORTAL')),logout_confirmed_at timestamptz,
- created_at timestamptz NOT NULL,expires_at timestamptz NOT NULL CHECK(expires_at>created_at),revoked_at timestamptz,
- CHECK((membership_id IS NULL)=(organization_id IS NULL)),
- CHECK((membership_id IS NULL)=(identity_version IS NULL)),
- CHECK((membership_id IS NULL)=(customer_ciphertext IS NULL)),
- CHECK((membership_id IS NULL)=(customer_expires_at IS NULL)),
- CHECK((refresh_lease_id IS NULL)=(refresh_started_at IS NULL)),
- CHECK((context_lease_id IS NULL)=(context_started_at IS NULL)),
- CHECK((logout_request_id IS NULL)=(logout_scope IS NULL))
+
+CREATE TABLE public.portal_sessions (
+    id uuid NOT NULL,
+    browser_id uuid NOT NULL,
+    token_hash text NOT NULL,
+    user_id uuid NOT NULL,
+    account_version bigint NOT NULL,
+    global_session_id uuid NOT NULL,
+    oidc_client_id uuid NOT NULL,
+    oidc_grant_id uuid NOT NULL,
+    oidc_client_policy_version bigint NOT NULL,
+    issuer text NOT NULL,
+    auth_time bigint NOT NULL,
+    nonce_hash text NOT NULL,
+    access_ciphertext text NOT NULL,
+    refresh_ciphertext text NOT NULL,
+    access_expires_at timestamp with time zone NOT NULL,
+    version bigint NOT NULL,
+    membership_id uuid,
+    organization_id uuid,
+    identity_version bigint,
+    customer_ciphertext text,
+    customer_expires_at timestamp with time zone,
+    customer_needs_renewal boolean DEFAULT false NOT NULL,
+    refresh_lease_id uuid,
+    refresh_started_at timestamp with time zone,
+    refresh_uncertain boolean DEFAULT false NOT NULL,
+    context_lease_id uuid,
+    context_started_at timestamp with time zone,
+    logout_request_id uuid,
+    logout_scope text,
+    logout_confirmed_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    CONSTRAINT portal_sessions_account_version_check CHECK ((account_version >= 0)),
+    CONSTRAINT portal_sessions_auth_time_check CHECK ((auth_time > 0)),
+    CONSTRAINT portal_sessions_browser_id_check CHECK (public.is_uuid_v7(browser_id)),
+    CONSTRAINT portal_sessions_check CHECK ((expires_at > created_at)),
+    CONSTRAINT portal_sessions_check1 CHECK (((membership_id IS NULL) = (organization_id IS NULL))),
+    CONSTRAINT portal_sessions_check2 CHECK (((membership_id IS NULL) = (identity_version IS NULL))),
+    CONSTRAINT portal_sessions_check3 CHECK (((membership_id IS NULL) = (customer_ciphertext IS NULL))),
+    CONSTRAINT portal_sessions_check4 CHECK (((membership_id IS NULL) = (customer_expires_at IS NULL))),
+    CONSTRAINT portal_sessions_check5 CHECK (((refresh_lease_id IS NULL) = (refresh_started_at IS NULL))),
+    CONSTRAINT portal_sessions_check6 CHECK (((context_lease_id IS NULL) = (context_started_at IS NULL))),
+    CONSTRAINT portal_sessions_check7 CHECK (((logout_request_id IS NULL) = (logout_scope IS NULL))),
+    CONSTRAINT portal_sessions_context_lease_id_check CHECK (((context_lease_id IS NULL) OR public.is_uuid_v7(context_lease_id))),
+    CONSTRAINT portal_sessions_global_session_id_check CHECK (public.is_uuid_v7(global_session_id)),
+    CONSTRAINT portal_sessions_id_check CHECK (public.is_uuid_v7(id)),
+    CONSTRAINT portal_sessions_identity_version_check CHECK (((identity_version IS NULL) OR (identity_version >= 1))),
+    CONSTRAINT portal_sessions_logout_request_id_check CHECK (((logout_request_id IS NULL) OR public.is_uuid_v7(logout_request_id))),
+    CONSTRAINT portal_sessions_logout_scope_check CHECK ((logout_scope = ANY (ARRAY['GLOBAL'::text, 'PORTAL'::text]))),
+    CONSTRAINT portal_sessions_membership_id_check CHECK (((membership_id IS NULL) OR public.is_uuid_v7(membership_id))),
+    CONSTRAINT portal_sessions_nonce_hash_check CHECK ((nonce_hash ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT portal_sessions_oidc_client_id_check CHECK (public.is_uuid_v7(oidc_client_id)),
+    CONSTRAINT portal_sessions_oidc_client_policy_version_check CHECK ((oidc_client_policy_version >= 1)),
+    CONSTRAINT portal_sessions_oidc_grant_id_check CHECK (public.is_uuid_v7(oidc_grant_id)),
+    CONSTRAINT portal_sessions_organization_id_check CHECK (((organization_id IS NULL) OR public.is_uuid_v7(organization_id))),
+    CONSTRAINT portal_sessions_refresh_lease_id_check CHECK (((refresh_lease_id IS NULL) OR public.is_uuid_v7(refresh_lease_id))),
+    CONSTRAINT portal_sessions_token_hash_check CHECK ((token_hash ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT portal_sessions_user_id_check CHECK (public.is_uuid_v7(user_id)),
+    CONSTRAINT portal_sessions_version_check CHECK ((version >= 1))
 );
-CREATE INDEX portal_sessions_subject ON portal_sessions(user_id);
-CREATE INDEX portal_sessions_expiry ON portal_sessions(expires_at);
+
+ALTER TABLE ONLY public.portal_browsers
+    ADD CONSTRAINT portal_browsers_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.portal_browsers
+    ADD CONSTRAINT portal_browsers_token_hash_key UNIQUE (token_hash);
+
+ALTER TABLE ONLY public.portal_login_flows
+    ADD CONSTRAINT portal_login_flows_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.portal_login_flows
+    ADD CONSTRAINT portal_login_flows_state_hash_key UNIQUE (state_hash);
+
+ALTER TABLE ONLY public.portal_sessions
+    ADD CONSTRAINT portal_sessions_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.portal_sessions
+    ADD CONSTRAINT portal_sessions_token_hash_key UNIQUE (token_hash);
+
+CREATE INDEX portal_login_flows_expiry ON public.portal_login_flows USING btree (expires_at);
+
+CREATE INDEX portal_sessions_expiry ON public.portal_sessions USING btree (expires_at);
+
+CREATE INDEX portal_sessions_subject ON public.portal_sessions USING btree (user_id);
+
+ALTER TABLE ONLY public.portal_login_flows
+    ADD CONSTRAINT portal_login_flows_browser_id_fkey FOREIGN KEY (browser_id) REFERENCES public.portal_browsers(id);
+
+ALTER TABLE ONLY public.portal_sessions
+    ADD CONSTRAINT portal_sessions_browser_id_fkey FOREIGN KEY (browser_id) REFERENCES public.portal_browsers(id);
+
+SET check_function_bodies = true;
+SELECT pg_catalog.set_config('search_path','public,pg_catalog,pg_temp',false);
