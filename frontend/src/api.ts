@@ -15,7 +15,7 @@ export interface PortalApi {
   configuration(signal: AbortSignal): Promise<void>
   session(signal: AbortSignal): Promise<PortalSession>
   loginBootstrap(signal: AbortSignal): Promise<PortalSession>
-  login(session: PortalSession, signal: AbortSignal): Promise<string>
+  login(session: PortalSession, signal: AbortSignal, switching?: boolean): Promise<string>
   select(session: PortalSession, membershipId: string, signal: AbortSignal): Promise<PortalSession>
   profile(session: PortalSession, signal: AbortSignal): Promise<Profile>
   logout(session: PortalSession, scope: 'PORTAL' | 'GLOBAL', signal: AbortSignal): Promise<string>
@@ -59,9 +59,9 @@ export function createApi(fetcher: Fetch = (input, init) => fetch(input, init)):
       }
       return session
     },
-    async login(session, signal) {
+    async login(session, signal, switching = false) {
       return parseRedirect(await request('/auth/login', signal, {
-        body: { returnTo: '/' }, csrfToken: session.csrfToken,
+        body: { returnTo: '/', ...(switching ? { expectedVersion: session.version } : {}) }, csrfToken: session.csrfToken,
       }))
     },
     async select(session, membershipId, signal) {

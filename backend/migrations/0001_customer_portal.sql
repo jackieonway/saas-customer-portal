@@ -31,6 +31,10 @@ CREATE TABLE public.portal_browsers (
 );
 
 CREATE TABLE public.portal_login_flows (
+    context_selection_required boolean NOT NULL DEFAULT false,
+    switch_session_id uuid CHECK (switch_session_id IS NULL OR public.is_uuid_v7(switch_session_id)),
+    switch_version bigint CHECK (switch_version>=1),
+    CONSTRAINT portal_login_flows_switch_binding_check CHECK ((switch_session_id IS NULL)=(switch_version IS NULL)),
     id uuid NOT NULL,
     browser_id uuid NOT NULL,
     browser_generation bigint NOT NULL,
@@ -52,6 +56,7 @@ CREATE TABLE public.portal_login_flows (
 );
 
 CREATE TABLE public.portal_sessions (
+    pending_selection_ciphertext text,
     id uuid NOT NULL,
     browser_id uuid NOT NULL,
     token_hash text NOT NULL,

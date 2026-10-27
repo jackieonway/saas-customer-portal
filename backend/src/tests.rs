@@ -67,6 +67,7 @@ fn session(state: &AppState) -> store::Session {
     let client = state.config.client_id;
     let issuer = state.config.issuer.clone();
     store::Session {
+        pending_selection_ciphertext: None,
         id,
         browser_id: Uuid::now_v7(),
         user_id: Uuid::now_v7(),

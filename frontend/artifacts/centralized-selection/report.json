@@ -1,0 +1,14 @@
+{
+  "status": "passed",
+  "scope": "Production bundle + explicit HTTP fixtures; no backend federation session",
+  "checks": [
+    {
+      "name": "desktop",
+      "status": "passed"
+    },
+    {
+      "name": "mobile",
+      "status": "passed"
+    }
+  ]
+}

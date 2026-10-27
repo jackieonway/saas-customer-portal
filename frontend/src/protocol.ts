@@ -30,6 +30,7 @@ export interface CustomerContext {
 }
 
 export interface PortalSession {
+  centralizedContextSelection?: boolean
   contractVersion: 'portal-session/1'
   version: string
   csrfToken: string
@@ -152,6 +153,7 @@ export function parseSession(value: unknown): PortalSession {
   return {
     contractVersion: 'portal-session/1',
     version: version(source.version),
+    centralizedContextSelection: source.centralizedContextSelection === true,
     csrfToken: text(source.csrfToken),
     account,
     memberships,

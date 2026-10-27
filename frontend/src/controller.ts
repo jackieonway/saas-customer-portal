@@ -26,6 +26,7 @@ export class PortalController {
   private state: PortalState = initialState
   private readonly listeners = new Set<() => void>()
   private epoch = 0
+  private managedRevision: string | null = null
   private abort: AbortController | null = null
   private readonly api: PortalApi
   private readonly effects: Effects
@@ -113,6 +114,7 @@ export class PortalController {
   private async accept(session: PortalSession, epoch: number, signal: AbortSignal, reconcileProfile = true): Promise<void> {
     if (!this.current(epoch)) return
     if (session.account === null || this.signedOutLanding) {
+      this.managedRevision = null
       this.publish({ status: 'signed-out', session, profile: null, busy: false })
       return
     }
@@ -132,6 +134,10 @@ export class PortalController {
     }
     if (!this.current(epoch)) return
     this.publish({ status: 'ready', session, profile, busy: false })
+    if (session.centralizedContextSelection) {
+      const revision = `${session.account.id}:${session.version}`
+      if (revision !== this.managedRevision) { this.managedRevision = revision; this.effects.broadcast(CHANGE_MESSAGE) }
+    }
   }
 
   readonly reload = async (): Promise<void> => {
@@ -157,6 +163,16 @@ export class PortalController {
     } catch (error) {
       this.fail(error, epoch)
     }
+  }
+
+  readonly switchContext = async (): Promise<void> => {
+    const session = this.state.session
+    if (!session?.account || !session.centralizedContextSelection || this.state.busy) return
+    const { epoch, signal } = this.begin()
+    try {
+      const redirectTo = await this.api.login(session, signal, true)
+      if (this.current(epoch)) this.effects.navigate(redirectTo)
+    } catch (error) { this.fail(error, epoch) }
   }
 
   readonly select = async (membershipId: string): Promise<void> => {

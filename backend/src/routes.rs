@@ -101,7 +101,8 @@ async fn session(
     b::origin(&state, &headers, true)?;
     no_query(raw)?;
     if b::cookie_value(&headers, b::SESSION_COOKIE)?.is_some() {
-        let original = authenticated(&state, &headers).await?;
+        let original =
+            crate::selection::resume(&state, authenticated(&state, &headers).await?).await?;
         if original.logout_request_id.is_some() {
             let scope = original.logout_scope.clone().ok_or(AppError::Unavailable)?;
             let chain = Chain::new(&state)?;
@@ -143,6 +144,8 @@ async fn anonymous(state: &AppState, headers: &HeaderMap) -> Result<Response, Ap
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Login {
     return_to: String,
+    #[serde(default)]
+    expected_version: Option<String>,
 }
 async fn login(
     State(state): State<AppState>,
@@ -172,12 +175,41 @@ async fn login(
         }
     }
     let chain = Chain::new(&state)?;
+    let switching = if let Some(expected) = &body.expected_version {
+        if !state.config.context_selection_enabled {
+            return Err(AppError::conflict("统一选择尚未启用"));
+        }
+        let original = authenticated(&state, &headers).await?;
+        b::require_csrf(&headers, session_cookie(&headers)?)?;
+        if original.version.to_string() != *expected {
+            return Err(AppError::conflict("原门户会话已变化"));
+        }
+        Some(store::online(&chain, original).await?)
+    } else {
+        None
+    };
     protocol::discovery(&chain).await?;
     let state_secret = b::secret()?;
     let nonce = b::secret()?;
     let verifier = b::secret()?;
     let binder = b::secret()?;
     let flow_id = Uuid::now_v7();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let context_request = if state.config.context_selection_enabled {
+        Some(
+            crate::selection::create(
+                &chain,
+                flow_id,
+                &b::digest(&state_secret),
+                &b::digest(&nonce),
+                &challenge,
+                switching.as_ref(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let encrypted = store::keys(&state)?.seal(
         flow_id,
         &state.config.issuer,
@@ -189,6 +221,12 @@ async fn login(
     let browser = store::browser(&mut *tx, &browser_hash, true)
         .await?
         .ok_or_else(invalid)?;
+    if switching
+        .as_ref()
+        .is_some_and(|s| s.browser_id != browser.id || browser.current_session_id != Some(s.id))
+    {
+        return Err(AppError::conflict("原门户浏览器会话已变化"));
+    }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('portal-login-capacity-v1',0))")
         .execute(&mut *tx)
         .await?;
@@ -199,6 +237,7 @@ async fn login(
     }
     sqlx::query("INSERT INTO portal_login_flows(id,browser_id,browser_generation,state_hash,binder_hash,nonce_hash,verifier_ciphertext,return_path,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp(),clock_timestamp()+interval '5 minutes')")
         .bind(flow_id).bind(browser.id).bind(browser.generation).bind(b::digest(&state_secret)).bind(b::digest(&binder)).bind(b::digest(&nonce)).bind(encrypted).bind(path).execute(&mut *tx).await?;
+    sqlx::query("UPDATE portal_login_flows SET context_selection_required=$2,switch_session_id=$3,switch_version=$4 WHERE id=$1").bind(flow_id).bind(state.config.context_selection_enabled).bind(switching.as_ref().map(|s|s.id)).bind(switching.as_ref().map(|s|s.version)).execute(&mut *tx).await?;
     tx.commit().await?;
     let mut url = reqwest::Url::parse(&format!("{}/oidc/authorize", state.config.issuer))
         .map_err(|_| AppError::Unavailable)?;
@@ -210,10 +249,11 @@ async fn login(
         .append_pair("state", &state_secret)
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge_method", "S256")
-        .append_pair(
-            "code_challenge",
-            &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
-        );
+        .append_pair("code_challenge", &challenge);
+    if let Some(reference) = context_request {
+        url.query_pairs_mut()
+            .append_pair("context_request", &reference);
+    }
     with_cookie(
         Json(json!({"redirectTo":url.as_str()})).into_response(),
         b::LOGIN_COOKIE,
@@ -293,6 +333,14 @@ async fn callback(
     )?;
     let chain = Chain::new(&state)?;
     let verified = protocol::exchange(&chain, code, &verifier, &flow.nonce_hash).await?;
+    if flow.context_selection_required != state.config.context_selection_enabled
+        || flow.context_selection_required != verified.selection.is_some()
+    {
+        return Err(invalid());
+    }
+    if let Some(selection) = &verified.selection {
+        selection.validate(flow.id)?;
+    }
     let cookie = b::secret()?;
     let id = Uuid::now_v7();
     let access = store::keys(&state)?.seal(
@@ -316,6 +364,25 @@ async fn callback(
     if current.id != flow.browser_id || current.generation != flow.browser_generation {
         return Err(AppError::conflict("其他登录已完成，本次回调不能覆盖新账号"));
     }
+    let old_access = if let Some(old_id) = flow.switch_session_id {
+        let old = store::session_id(&mut *tx, old_id, true)
+            .await?
+            .ok_or_else(invalid)?;
+        if current.current_session_id != Some(old_id)
+            || Some(old.version) != flow.switch_version
+            || old.user_id != verified.proof.user_id
+            || old.revoked_at.is_some()
+            || old.expires_at <= Utc::now()
+            || old.logout_request_id.is_some()
+            || old.pending_selection_ciphertext.is_some()
+        {
+            return Err(AppError::conflict("原门户会话已失效或被其他标签页替换"));
+        }
+        Some(store::access(&state, &old)?)
+    } else {
+        None
+    };
+    let pending = crate::selection::pending_cipher(&state, id, &verified, old_access)?;
     if let Some(previous) = current.current_session_id {
         sqlx::query("UPDATE portal_sessions SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE id=$1").bind(previous).execute(&mut *tx).await?;
     }
@@ -331,6 +398,11 @@ async fn callback(
     sqlx::query("INSERT INTO portal_sessions(id,browser_id,token_hash,user_id,account_version,global_session_id,oidc_client_id,oidc_grant_id,oidc_client_policy_version,issuer,auth_time,nonce_hash,access_ciphertext,refresh_ciphertext,access_expires_at,version,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$17,clock_timestamp(),$16)")
         .bind(id).bind(current.id).bind(b::digest(&cookie)).bind(verified.proof.user_id).bind(verified.proof.account_version).bind(verified.proof.global_session_id).bind(state.config.client_id)
         .bind(verified.proof.grant_id).bind(verified.proof.client_policy_version).bind(&state.config.issuer).bind(verified.proof.auth_time).bind(&flow.nonce_hash).bind(access).bind(refresh).bind(verified.proof.expires_at).bind(verified.absolute_expires_at).bind(version).execute(&mut *tx).await?;
+    sqlx::query("UPDATE portal_sessions SET pending_selection_ciphertext=$2 WHERE id=$1")
+        .bind(id)
+        .bind(pending)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("UPDATE portal_browsers SET generation=generation+1,current_session_id=$2,expires_at=GREATEST(expires_at,$3) WHERE id=$1").bind(current.id).bind(id).bind(verified.absolute_expires_at).execute(&mut *tx).await?;
     store::deadline(
         &mut tx,
@@ -343,6 +415,14 @@ async fn callback(
     )
     .await?;
     tx.commit().await?;
+    if flow.context_selection_required {
+        let original = store::session_id(&state.pool, id, false)
+            .await?
+            .ok_or_else(invalid)?;
+        // The new Cookie reaches the browser even if the remote commit or the
+        // independent local save is uncertain. GET resumes this exact operation.
+        let _ = crate::selection::resume(&state, original).await;
+    }
     with_cookie(
         Redirect::to(&flow.return_path).into_response(),
         b::SESSION_COOKIE,
@@ -362,6 +442,9 @@ async fn context(
     RawQuery(raw): RawQuery,
     body: Result<Json<Selection>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, AppError> {
+    if state.config.context_selection_enabled {
+        return Err(AppError::forbidden("请前往认证中心选择租户和组织"));
+    }
     b::origin(&state, &headers, false)?;
     no_query(raw)?;
     let Json(body) = body.map_err(|_| bad())?;

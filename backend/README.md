@@ -28,11 +28,14 @@ constitute production registration.
 | `OIDC_CLIENT_SECRET` | Independently provisioned confidential RP secret, at least 32 characters |
 | `OIDC_REDIRECT_URI` | Exactly `${PUBLIC_CUSTOMER_URL}/auth/callback` |
 | `OIDC_CA_FILE` | Optional absolute PEM CA bundle for the provider; normal hostname/chain validation remains enabled |
-| `CUSTOMER_RESOURCE_URL` | Fixed HTTPS platform resource origin, e.g. `https://console.saas.test` |
+| `CUSTOMER_RESOURCE_URL` | Fixed private HTTPS platform resource origin, e.g. `https://platform-internal.saas.test`; the public console gateway rejects `/internal/*` |
 | `CUSTOMER_RESOURCE_CLIENT_ID` | Public ID of a separate confidential USER profile client registered to the CUSTOMER profile application |
 | `CUSTOMER_RESOURCE_CLIENT_SECRET` | Resource client's own secret; must differ from the RP secret |
 | `CUSTOMER_RESOURCE_CA_FILE` | Optional absolute PEM CA bundle for the resource origin |
 | `PORTAL_TOKEN_KEY_FILE` | Absolute private AES-256-GCM keyring JSON file |
+| `CONTEXT_SELECTION_ENABLED` | Exact `true` enables centralized selection; default `false`. Requires matching identity/platform RP registrations |
+| `CONTEXT_SELECTION_CONSUMER_ID` | Canonical UUIDv7 of an independent `CONTEXT_SELECTION_CONSUMER`, scoped to this RP |
+| `CONTEXT_SELECTION_CONSUMER_SECRET` | Independent 32-byte random secret as 64 lowercase hex characters; different from both RP and resource credentials |
 
 Keyring shape (the placeholder is deliberately not usable key material):
 
@@ -55,9 +58,30 @@ credential, login query, cookie, private key or request body is logged.
 Create a new portal database using an operator-owned migration role, then run
 `cargo run --locked --bin portal-migrate` with its explicit `DATABASE_URL`.
 The migration creates only `portal_browsers`, `portal_login_flows` and
-`portal_sessions`, plus SQLx's migration history. All 15 UUID columns have an
+`portal_sessions`, plus SQLx's migration history. All 16 UUID columns have an
 individual validated RFC UUID v7 check and no UUID default. The database holds
 no authority replica and cannot create customer members.
+
+With centralized selection enabled, the authorization request binds a backend-created
+interaction to state, nonce, PKCE and an optional original session/version. The
+identity UI confirms application consent, then tenant, then organization. The code
+extension stays on the backend. The callback saves an encrypted pending operation
+before calling platform consumption. `/auth/session` can resume only that recorded
+operation: it queries the existing result first and consumes only an uncommitted
+selection. A lost reply or failed local save returns the same encrypted customer
+capability, without another issuance or expiry extension. A pending operation
+cannot serve an ordinary session or profile. `/auth/context` rejects direct choices
+for the enabled mode. The frontend uses the current session CSRF and version to
+start a central switch and clears displayed data before navigation.
+
+The platform must configure its BFF AES keyring for encrypted customer-result
+recovery, along with independent source verification credentials and the existing
+customer proof/resource registration. The external selection consumer secret does
+not authenticate ordinary profile calls. See the workspace
+[selection contract](../../saas-plateform/backend/docs/designs/context-selection-contract.md)
+and [verification record](../../saas-plateform/backend/docs/designs/centralized-context-selection-verification.md)
+for integration limits. Production enablement still requires the real HTTPS path
+and deployment-registration checks described there.
 
 Start `saas-customer-portal-backend` under a separate runtime role with only
 SELECT/INSERT/UPDATE/DELETE on those three portal tables and EXECUTE/USAGE as

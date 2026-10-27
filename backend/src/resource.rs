@@ -113,6 +113,7 @@ async fn call<T: serde::de::DeserializeOwned>(
     let c = &chain.state.config;
     let response = chain
         .send(OidcRequest {
+            json: None,
             endpoint,
             authorization: Some(format!(
                 "Basic {}",

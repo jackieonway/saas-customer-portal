@@ -26,6 +26,7 @@ pub(crate) struct AccountProof {
     pub expires_at: DateTime<Utc>,
 }
 pub(crate) struct Verified {
+    pub selection: Option<crate::selection::Extension>,
     pub proof: AccountProof,
     pub access: String,
     pub refresh: String,
@@ -97,6 +98,7 @@ async fn call(
     json(
         chain
             .send(OidcRequest {
+                json: None,
                 endpoint,
                 authorization,
                 form,
@@ -387,6 +389,17 @@ async fn verified(
     userinfo(chain, &access, proof.user_id).await?;
     proof.expires_at = proof.expires_at.min(identity.expires_at);
     Ok(Verified {
+        selection: if original.is_none() {
+            response
+                .get("context_selection")
+                .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid()))
+                .transpose()?
+        } else {
+            if response.get("context_selection").is_some() {
+                return Err(invalid());
+            }
+            None
+        },
         proof,
         access,
         refresh,
@@ -462,6 +475,7 @@ pub(crate) async fn logout(
     }
     let response = chain
         .send(OidcRequest {
+            json: None,
             endpoint,
             authorization: Some(basic(chain)?),
             form,

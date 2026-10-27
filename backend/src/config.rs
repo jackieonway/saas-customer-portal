@@ -4,6 +4,9 @@ use uuid::Uuid;
 
 pub(crate) struct Config {
     pub enabled: bool,
+    pub context_selection_enabled: bool,
+    pub selection_client_id: String,
+    pub selection_client_secret: String,
     pub database_url: String,
     pub bind_addr: SocketAddr,
     pub public_origin: String,
@@ -169,7 +172,48 @@ impl Config {
         } else {
             None
         };
+        let context_selection_enabled = match values
+            .get("CONTEXT_SELECTION_ENABLED")
+            .map(String::as_str)
+            .unwrap_or("false")
+        {
+            "true" => true,
+            "false" => false,
+            _ => anyhow::bail!("CONTEXT_SELECTION_ENABLED must be true or false"),
+        };
+        let selection_client_id = values
+            .get("CONTEXT_SELECTION_CONSUMER_ID")
+            .cloned()
+            .unwrap_or_default();
+        let selection_client_secret = values
+            .get("CONTEXT_SELECTION_CONSUMER_SECRET")
+            .cloned()
+            .unwrap_or_default();
+        if context_selection_enabled {
+            anyhow::ensure!(enabled, "context selection requires enabled portal");
+            id(&selection_client_id)
+                .map_err(|_| anyhow::anyhow!("selection consumer id must be canonical UUIDv7"))?;
+            anyhow::ensure!(
+                selection_client_id != client_id.to_string()
+                    && selection_client_id != resource_client_id
+                    && selection_client_secret != client_secret
+                    && selection_client_secret != resource_client_secret
+                    && selection_client_secret.len() == 64
+                    && selection_client_secret
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "independent selection consumer required"
+            );
+        } else {
+            anyhow::ensure!(
+                selection_client_id.is_empty() && selection_client_secret.is_empty(),
+                "selection credentials require explicit enablement"
+            );
+        }
         Ok(Self {
+            context_selection_enabled,
+            selection_client_id,
+            selection_client_secret,
             enabled,
             database_url,
             bind_addr,

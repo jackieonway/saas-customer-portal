@@ -79,6 +79,29 @@ test('valid self profile is bound to the complete selected customer identity', (
   assert.deepEqual(parseProfile(profile(), value), profile())
 })
 
+test('centralized customer switch clears data, binds the original version and bypasses local membership selection', async () => {
+  const waiting = deferred()
+  const selected = session({ centralizedContextSelection: true })
+  const h = harness({ session: async () => selected, login: async (value, signal, switching) => {
+    assert.equal(value.version, selected.version)
+    assert.equal(switching, true)
+    assert.equal(signal.aborted, false)
+    return waiting.promise
+  } })
+  await h.controller.reload()
+  assert.equal(h.calls.broadcast.length, 1)
+  const switching = h.controller.switchContext()
+  assert.equal(h.controller.getSnapshot().profile, null)
+  assert.equal(h.controller.getSnapshot().busy, true)
+  waiting.resolve('https://auth.owned.test/oidc/authorize')
+  await switching
+  assert.deepEqual(h.calls.navigation, ['https://auth.owned.test/oidc/authorize'])
+  assert.deepEqual(h.calls.selection, [])
+  assert.equal(h.calls.bootstrap, 0)
+  await h.controller.reload()
+  assert.equal(h.calls.broadcast.length, 1)
+})
+
 test('initial account generation zero completes explicit selection and self-profile transport', async () => {
   const selected = session({ version: '2', context: { ...session().context, accountVersion: '0' } })
   const requests = []

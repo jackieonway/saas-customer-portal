@@ -28,7 +28,10 @@ impl Owned {
             sqlx::query_scalar("SELECT system_identifier::text FROM pg_control_system()")
                 .fetch_one(&admin)
                 .await?;
-        ensure!(cluster == "7700230159816609830", "wrong test cluster");
+        let expected = std::env::var("CONTEXT_SELECTION_TEST_CLUSTER_ID").map_err(|_| {
+            anyhow::anyhow!("explicit task-owned CONTEXT_SELECTION_TEST_CLUSTER_ID required")
+        })?;
+        ensure!(cluster == expected, "wrong test cluster");
         let name = format!("identity_phase11_portal_test_{}", Uuid::now_v7().simple());
         sqlx::query(&format!("CREATE DATABASE \"{name}\""))
             .execute(&admin)
@@ -75,6 +78,7 @@ async fn insert(state: &AppState) -> Result<store::Session> {
 }
 fn verified(s: &store::Session) -> protocol::Verified {
     protocol::Verified {
+        selection: None,
         proof: protocol::AccountProof {
             user_id: s.user_id,
             global_session_id: s.global_session_id,
@@ -91,6 +95,40 @@ fn verified(s: &store::Session) -> protocol::Verified {
         id_expires_at: s.access_expires_at,
     }
 }
+
+#[tokio::test]
+#[ignore = "requires explicit task-owned PostgreSQL and cluster identifier"]
+async fn centralized_pending_commit_recovers_after_local_save_failure_without_reissuing(
+) -> Result<()> {
+    let db = Owned::new().await?;
+    let mut state = db.state();
+    Arc::get_mut(&mut state.config)
+        .unwrap()
+        .context_selection_enabled = true;
+    let result=async {
+        let mut s=insert(&state).await?;
+        let flow=Uuid::now_v7();
+        let pending=crate::selection::Pending {extension:crate::selection::Extension{contract_version:"context-selection/1".into(),transaction_id:flow.to_string(),credential:"c".repeat(64)},old_access:None};
+        let encrypted=store::keys(&state)?.seal(s.id,&s.issuer,s.oidc_client_id,"pending-selection",&serde_json::to_string(&pending)?)?;
+        sqlx::query("UPDATE portal_sessions SET pending_selection_ciphertext=$2 WHERE id=$1").bind(s.id).bind(&encrypted).execute(&state.pool).await?;
+        s.pending_selection_ciphertext=Some(encrypted.clone());
+        let m=super::member(&s);
+        let response=json!({"status":"COMMITTED","customerContext":format!("cpc_{}","d".repeat(64)),"expiresAt":s.access_expires_at,"context":super::context(&s,&m),"account":super::account(&s)});
+        state.transport=Arc::new(Script(Mutex::new(std::collections::VecDeque::from([(Endpoint::SelectionResult,200,response.clone()),(Endpoint::SelectionResult,200,response)]))));
+        ensure!(store::online(&Chain::new(&state)?,s.clone()).await.is_err(),"pending operation allowed an ordinary session read");
+        sqlx::raw_sql("CREATE FUNCTION suppress_pending_save() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.pending_selection_ciphertext IS NOT NULL AND NEW.pending_selection_ciphertext IS NULL THEN RETURN NULL; END IF; RETURN NEW; END $$; CREATE TRIGGER suppress_pending_save BEFORE UPDATE ON portal_sessions FOR EACH ROW EXECUTE FUNCTION suppress_pending_save();").execute(&state.pool).await?;
+        ensure!(crate::selection::resume(&state,s.clone()).await.is_err(),"suppressed local save announced success");
+        let saved:Option<String>=sqlx::query_scalar("SELECT pending_selection_ciphertext FROM portal_sessions WHERE id=$1").bind(s.id).fetch_one(&state.pool).await?;
+        ensure!(saved.as_deref()==Some(encrypted.as_str()),"failed local save lost its original operation");
+        sqlx::raw_sql("DROP TRIGGER suppress_pending_save ON portal_sessions; DROP FUNCTION suppress_pending_save();").execute(&state.pool).await?;
+        let restored=crate::selection::resume(&state,s).await?;
+        ensure!(restored.pending_selection_ciphertext.is_none() && restored.membership_id==Some(m.membership_id) && restored.version==1,"result recovery changed operation or identity");
+        Ok(())
+    }.await;
+    drop(state);
+    db.finish().await?;
+    result
+}
 #[tokio::test]
 #[ignore = "requires explicit task-owned phase11 PostgreSQL"]
 async fn phase11_pg_every_uuid_has_its_own_v7_guard_and_no_authority_tables() -> Result<()> {
@@ -98,7 +136,7 @@ async fn phase11_pg_every_uuid_has_its_own_v7_guard_and_no_authority_tables() ->
     let result=async {
         let columns:i64=sqlx::query_scalar("SELECT count(*) FROM pg_attribute a JOIN pg_class t ON t.oid=a.attrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND t.relkind='r' AND a.attnum>0 AND NOT a.attisdropped AND a.atttypid='uuid'::regtype").fetch_one(&db.pool).await?;
         let guarded:i64=sqlx::query_scalar("SELECT count(*) FROM pg_attribute a JOIN pg_class t ON t.oid=a.attrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND t.relkind='r' AND a.attnum>0 AND NOT a.attisdropped AND a.atttypid='uuid'::regtype AND NOT a.atthasdef AND EXISTS(SELECT 1 FROM pg_constraint c WHERE c.conrelid=t.oid AND c.contype='c' AND c.convalidated AND c.conkey=ARRAY[a.attnum]::smallint[] AND pg_get_constraintdef(c.oid) LIKE '%is_uuid_v7%')").fetch_one(&db.pool).await?;
-        ensure!(columns==15 && guarded==columns,"UUID guard/default coverage mismatch");
+        ensure!(columns==16 && guarded==columns,"UUID guard/default coverage mismatch");
         let tables:Vec<String>=sqlx::query_scalar("SELECT tablename::text FROM pg_tables WHERE schemaname='public' ORDER BY tablename").fetch_all(&db.pool).await?;
         ensure!(tables==["_sqlx_migrations","portal_browsers","portal_login_flows","portal_sessions"],"authority data leaked into portal database");Ok(())
     }.await;

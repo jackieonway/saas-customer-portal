@@ -74,7 +74,11 @@ function IdentityPanel({ state, controller }: { state: PortalState; controller: 
 
   return <section className="identity-section" aria-labelledby="identity-title">
     <div className="section-heading"><span className="section-index">01</span><div><span className="eyebrow">您的归属</span><h2 id="identity-title">选择客户身份</h2></div></div>
-    {session.memberships.length === 0
+    {session.centralizedContextSelection ? <div className="empty-state">
+      <h3>{session.context ? `${session.context.tenant.name} / ${session.context.organization.name}` : '在认证中心确认此次身份'}</h3>
+      <p>先选择租户，再选择组织。切换后，此门户只展示新身份下的本人资料。</p>
+      <button className="button button-secondary" onClick={() => void controller.switchContext()} data-testid="portal-central-switch">切换租户和组织 <Arrow /></button>
+    </div> : session.memberships.length === 0
       ? <div className="empty-state" data-testid="portal-no-customer"><h3>账号已确认，暂时没有客户身份。</h3>
         <p>仅有员工身份的账号也需要由所属组织登记客户身份，才能进入客户空间。门户不会自动新增或绑定关系。</p>
         <p className="fine-print">如需协助，请联系您的组织管理员。</p></div>

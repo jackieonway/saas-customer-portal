@@ -16,6 +16,9 @@ pub(crate) enum Endpoint {
     Context,
     Profile,
     ContextRevoke,
+    ContextInteractions,
+    SelectionConsume,
+    SelectionResult,
 }
 impl Endpoint {
     pub(crate) fn path(self) -> &'static str {
@@ -31,12 +34,20 @@ impl Endpoint {
             Self::Context => "/internal/customer-portal/context",
             Self::Profile => "/internal/customer-portal/profile",
             Self::ContextRevoke => "/internal/customer-portal/revoke",
+            Self::ContextInteractions => "/oidc/context-interactions",
+            Self::SelectionConsume => "/internal/platform/context-selection/consume",
+            Self::SelectionResult => "/internal/platform/context-selection/result",
         }
     }
     fn resource(self) -> bool {
         matches!(
             self,
-            Self::Memberships | Self::Context | Self::Profile | Self::ContextRevoke
+            Self::Memberships
+                | Self::Context
+                | Self::Profile
+                | Self::ContextRevoke
+                | Self::SelectionConsume
+                | Self::SelectionResult
         )
     }
     fn post(self) -> bool {
@@ -47,6 +58,7 @@ pub(crate) struct OidcRequest {
     pub endpoint: Endpoint,
     pub authorization: Option<String>,
     pub form: Vec<(String, String)>,
+    pub json: Option<serde_json::Value>,
 }
 pub(crate) struct OidcResponse {
     pub status: u16,
@@ -94,7 +106,11 @@ impl OidcTransport for HttpTransport {
                 client.get(url)
             };
             if request.endpoint.post() {
-                outgoing = if is_resource {
+                outgoing = if let Some(body) = request.json {
+                    outgoing
+                        .header("content-type", "application/json")
+                        .body(serde_json::to_vec(&body).map_err(|_| AppError::Unavailable)?)
+                } else if is_resource {
                     let object: serde_json::Map<String, serde_json::Value> = request
                         .form
                         .into_iter()

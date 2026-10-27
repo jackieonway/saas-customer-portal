@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 #[derive(Clone, sqlx::FromRow)]
 pub(crate) struct Session {
+    pub pending_selection_ciphertext: Option<String>,
     pub id: Uuid,
     pub browser_id: Uuid,
     pub user_id: Uuid,
@@ -50,6 +51,9 @@ pub(crate) struct Browser {
 }
 #[derive(sqlx::FromRow)]
 pub(crate) struct Flow {
+    pub switch_session_id: Option<Uuid>,
+    pub switch_version: Option<i64>,
+    pub context_selection_required: bool,
     pub id: Uuid,
     pub browser_id: Uuid,
     pub browser_generation: i64,
@@ -147,6 +151,9 @@ pub(crate) fn customer(state: &AppState, session: &Session) -> Result<String, Ap
     )
 }
 pub(crate) async fn online(chain: &Chain<'_>, original: Session) -> Result<Session, AppError> {
+    if original.pending_selection_ciphertext.is_some() {
+        return Err(AppError::Unavailable);
+    }
     let state = chain.state;
     if original.revoked_at.is_some()
         || original.issuer != state.config.issuer

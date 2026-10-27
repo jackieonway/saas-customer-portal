@@ -44,6 +44,7 @@ pub(crate) async fn view(chain: &Chain<'_>, mut s: Session, csrf: &str) -> Resul
     final_check(chain, &s).await?;
     Ok(
         json!({"contractVersion":"portal-session/1","version":s.version.to_string(),"csrfToken":csrf,
+        "centralizedContextSelection":chain.state.config.context_selection_enabled,
         "account":available.account,"memberships":available.memberships,"context":context}),
     )
 }

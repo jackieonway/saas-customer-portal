@@ -8,6 +8,7 @@ mod error;
 mod protocol;
 mod resource;
 mod routes;
+mod selection;
 mod store;
 mod transport;
 mod usecases;
