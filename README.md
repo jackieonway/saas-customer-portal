@@ -1,6 +1,6 @@
 # 客户门户
 
-独立客户 OIDC BFF 与本人资料入口。客户在同一认证中心登录后，只选择真实有效的 CUSTOMER 成员；员工控制台继续使用自己的员工 RP 与会话。
+独立客户 OIDC BFF 与本人资料入口。门户使用认证中心 canonical `/oauth/*` 及独立客户私有证明，公开 subject 保持 opaque，内部账号 ID 仅来自受认证证明。客户在同一认证中心登录后，只选择真实有效的 CUSTOMER 成员；员工控制台继续使用自己的员工 RP 与会话。
 
 后端在独立 PostgreSQL 数据库执行 `backend/migrations/0001_customer_portal.sql`，服务端加密保存上游凭据。浏览器只持有 HttpOnly Cookie、最小 DTO 与内存 CSRF，不保存 OIDC access/refresh 或派生资源 token。
 

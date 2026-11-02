@@ -47,6 +47,8 @@ fn config() -> Config {
     config.enabled = true;
     config.client_id = Uuid::now_v7();
     config.client_secret = "fixture-only-unusable-client-secret-9A".into();
+    config.source_service_id = Uuid::now_v7();
+    config.source_service_secret = "ab".repeat(32);
     config.resource_client_id = "fixture-profile-client".into();
     config.resource_client_secret = "fixture-only-unusable-profile-secret-8B".into();
     config.keys = Some(Arc::new(CipherKeys::fixture()));
@@ -71,12 +73,14 @@ fn session(state: &AppState) -> store::Session {
         id,
         browser_id: Uuid::now_v7(),
         user_id: Uuid::now_v7(),
-        account_version: 0,
+        account_version: 1,
         global_session_id: Uuid::now_v7(),
         oidc_client_id: client,
         oidc_grant_id: Uuid::now_v7(),
         oidc_client_policy_version: 1,
         issuer: issuer.clone(),
+        oidc_public_sid: b::secret().unwrap(),
+        oidc_public_sub: "pairwise-customer-fixture-no-uuid".into(),
         auth_time: Utc::now().timestamp() - 10,
         nonce_hash: b::digest("fixture-nonce"),
         access_ciphertext: state
@@ -112,9 +116,11 @@ fn session(state: &AppState) -> store::Session {
     }
 }
 fn proof(s: &store::Session) -> Value {
-    json!({"active":true,"client_id":s.oidc_client_id,"aud":s.oidc_client_id,"iss":s.issuer,"token_type":"Bearer","scope":"openid profile offline_access",
-        "sub":s.user_id,"sid":s.global_session_id,"exp":s.access_expires_at.timestamp(),"accountProof":{"contractVersion":"oidc-account-proof/1","clientPurpose":"CUSTOMER_PORTAL","allowedMemberTypes":["CUSTOMER"],
-        "grantId":s.oidc_grant_id,"accountVersion":s.account_version.to_string(),"clientPolicyVersion":s.oidc_client_policy_version.to_string(),"authTime":s.auth_time}})
+    json!({"contractVersion":"customer-account-proof/1","clientId":s.oidc_client_id,"issuer":s.issuer,
+        "clientPurpose":"CUSTOMER_PORTAL","contextMode":"PLATFORM_CONTEXT","allowedMemberTypes":["CUSTOMER"],"scope":["openid","profile"],
+        "sub":"pairwise-customer-fixture-no-uuid","userId":s.user_id,"globalSessionId":s.global_session_id,
+        "grantId":s.oidc_grant_id,"accountVersion":s.account_version.to_string(),"clientPolicyVersion":s.oidc_client_policy_version.to_string(),
+        "applicationProjectionVersion":"1","authTime":s.auth_time,"expiresAt":s.access_expires_at,"absoluteExpiresAt":s.expires_at})
 }
 fn account(s: &store::Session) -> Value {
     json!({"id":s.user_id,"username":"fixture","realName":"Fixture","avatar":""})
@@ -294,12 +300,11 @@ async fn exact_customer_purpose_is_required_before_userinfo() {
         let mut state = state(vec![]);
         let s = session(&state);
         let mut value = proof(&s);
-        value["accountProof"]["clientPurpose"] = json!(purpose);
-        value["accountProof"]["allowedMemberTypes"] = types;
-        value["active"] = json!(active);
+        value["clientPurpose"] = json!(purpose);
+        value["allowedMemberTypes"] = types;
         state.transport = Arc::new(Script(Mutex::new(VecDeque::from([(
-            Endpoint::Introspect,
-            200,
+            Endpoint::AccountProof,
+            if active { 200 } else { 401 },
             value,
         )]))));
         assert!(
@@ -311,20 +316,20 @@ async fn exact_customer_purpose_is_required_before_userinfo() {
 }
 #[tokio::test]
 async fn source_subject_grant_and_userinfo_cannot_adopt_a_different_account() {
-    for field in ["sub", "sid", "grantId", "userinfo"] {
+    for field in ["userId", "globalSessionId", "grantId", "sub", "userinfo"] {
         let mut state = state(vec![]);
         let s = session(&state);
         let mut value = proof(&s);
-        let mut subject = s.user_id;
+        let mut subject = "pairwise-customer-fixture-no-uuid";
         if field == "userinfo" {
-            subject = Uuid::now_v7();
-        } else if field == "grantId" {
-            value["accountProof"][field] = json!(Uuid::now_v7());
+            subject = "pairwise-another-customer-account";
+        } else if field == "sub" {
+            value[field] = json!("pairwise-unrelated-customer-account");
         } else {
             value[field] = json!(Uuid::now_v7());
         }
-        let mut script = VecDeque::from([(Endpoint::Introspect, 200, value)]);
-        if field == "userinfo" {
+        let mut script = VecDeque::from([(Endpoint::AccountProof, 200, value)]);
+        if matches!(field, "sub" | "userinfo") {
             script.push_back((Endpoint::UserInfo, 200, json!({"sub":subject})));
         }
         state.transport = Arc::new(Script(Mutex::new(script)));
@@ -332,6 +337,120 @@ async fn source_subject_grant_and_userinfo_cannot_adopt_a_different_account() {
             protocol::existing(&Chain::new(&state).unwrap(), &s, &"a".repeat(64))
                 .await
                 .is_err()
+        );
+    }
+}
+
+fn discovery() -> Value {
+    let issuer = "https://auth.saas.test";
+    json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/oauth/authorize"),
+        "token_endpoint":format!("{issuer}/oauth/token"),"jwks_uri":format!("{issuer}/oauth/jwks"),
+        "userinfo_endpoint":format!("{issuer}/oauth/userinfo"),"introspection_endpoint":format!("{issuer}/oauth/introspect"),
+        "revocation_endpoint":format!("{issuer}/oauth/revoke"),"response_types_supported":["code"],
+        "id_token_signing_alg_values_supported":["RS256"],"token_endpoint_auth_methods_supported":["client_secret_basic"],
+        "code_challenge_methods_supported":["S256"]})
+}
+
+#[tokio::test]
+async fn canonical_refresh_uses_access_proof_and_accepts_response_without_id_token() {
+    let mut state = state(vec![]);
+    let original = session(&state);
+    let value = proof(&original);
+    state.transport = Arc::new(Script(Mutex::new(VecDeque::from([
+        (Endpoint::Discovery, 200, discovery()),
+        (
+            Endpoint::Token,
+            200,
+            json!({"token_type":"Bearer","access_token":"9".repeat(64),
+            "refresh_token":"8".repeat(64),"expires_in":300,"scope":"openid profile"}),
+        ),
+        (Endpoint::AccountProof, 200, value),
+        (
+            Endpoint::UserInfo,
+            200,
+            json!({"sub":"pairwise-customer-fixture-no-uuid"}),
+        ),
+    ]))));
+    let verified = protocol::refresh(&Chain::new(&state).unwrap(), &original, &"b".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(verified.proof.user_id, original.user_id);
+    assert_eq!(verified.proof.subject, "pairwise-customer-fixture-no-uuid");
+    assert_eq!(verified.absolute_expires_at, original.expires_at);
+    assert!(verified.selection.is_none());
+}
+
+#[tokio::test]
+async fn canonical_code_exchange_requires_id_token_and_never_accepts_offline_scope() {
+    for scope in ["openid profile", "openid profile offline_access"] {
+        let state = state(vec![
+            (Endpoint::Discovery, 200, discovery()),
+            (
+                Endpoint::Token,
+                200,
+                json!({"token_type":"Bearer","access_token":"9".repeat(64),
+                "refresh_token":"8".repeat(64),"expires_in":300,"scope":scope}),
+            ),
+        ]);
+        assert!(matches!(
+            protocol::exchange(
+                &Chain::new(&state).unwrap(),
+                "owned-code",
+                &"a".repeat(64),
+                &b::digest("nonce")
+            )
+            .await,
+            Err(AppError::Unauthorized(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn invalid_rp_credentials_are_unavailable_infrastructure_not_a_repaired_user_session() {
+    let mut state = state(vec![]);
+    let original = session(&state);
+    state.transport = Arc::new(Script(Mutex::new(VecDeque::from([
+        (Endpoint::Discovery, 200, discovery()),
+        (Endpoint::Token, 401, json!({"error":"invalid_client"})),
+    ]))));
+    assert!(matches!(
+        protocol::refresh(&Chain::new(&state).unwrap(), &original, &"b".repeat(64)).await,
+        Err(AppError::Unavailable)
+    ));
+}
+
+#[tokio::test]
+async fn private_customer_proof_rejects_wrong_client_scope_versions_and_deadlines() {
+    for (field, value) in [
+        ("contractVersion", json!("platform-account-proof/1")),
+        ("clientId", json!(Uuid::now_v7())),
+        ("issuer", json!("https://other.saas.test")),
+        ("contextMode", json!("ACCOUNT_ONLY")),
+        ("scope", json!(["openid"])),
+        ("scope", json!(["openid", "profile", "offline_access"])),
+        ("sub", json!("")),
+        ("sub", json!("unsafe\nsubject")),
+        ("accountVersion", json!("0")),
+        ("clientPolicyVersion", json!("01")),
+        ("applicationProjectionVersion", json!("0")),
+        ("authTime", json!(Utc::now().timestamp() + 61)),
+        ("expiresAt", json!(Utc::now() - Duration::seconds(1))),
+        ("absoluteExpiresAt", json!(Utc::now())),
+    ] {
+        let mut state = state(vec![]);
+        let original = session(&state);
+        let mut response = proof(&original);
+        response[field] = value;
+        state.transport = Arc::new(Script(Mutex::new(VecDeque::from([(
+            Endpoint::AccountProof,
+            200,
+            response,
+        )]))));
+        assert!(
+            protocol::existing(&Chain::new(&state).unwrap(), &original, &"a".repeat(64))
+                .await
+                .is_err(),
+            "accepted {field}"
         );
     }
 }
@@ -438,6 +557,147 @@ async fn static_routes_are_minimal_and_all_responses_prohibit_storage() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn backchannel_rejects_query_duplicate_fields_and_browser_token_substitution() {
+    let app = crate::routes::routes().with_state(state(vec![]));
+    for (uri, body) in [
+        ("/auth/backchannel-logout?token=hidden", "logout_token=x"),
+        ("/auth/backchannel-logout", "logout_token=x&logout_token=y"),
+        ("/auth/backchannel-logout", "logout_token=x&other=y"),
+        ("/auth/backchannel-logout", "token=x"),
+    ] {
+        let result = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("host", "customer.saas.test")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(result.headers()["cache-control"], "no-store");
+    }
+}
+
+#[tokio::test]
+async fn canonical_logout_recovers_same_original_operation_before_any_revoke_attempt() {
+    for scope in ["PORTAL", "GLOBAL"] {
+        let mut state = state(vec![]);
+        let session = session(&state);
+        let op = Uuid::now_v7();
+        let wire = if scope == "GLOBAL" {
+            "GLOBAL"
+        } else {
+            "CURRENT_APP"
+        };
+        let receipt = json!({"operationId":op,"scope":wire,"state":"COMPLETED","revokedGrantCount":1,"revokedSsoCount":0,"notificationCount":1});
+        state.transport = Arc::new(Script(Mutex::new(VecDeque::from([
+            (
+                Endpoint::LogoutOperation(op),
+                404,
+                json!({"code":"NOT_FOUND"}),
+            ),
+            (
+                Endpoint::GlobalLogout,
+                503,
+                json!({"error":"temporarily_unavailable"}),
+            ),
+            (Endpoint::LogoutOperation(op), 200, receipt),
+        ]))));
+        let chain = Chain::new(&state).unwrap();
+        assert!(matches!(
+            protocol::logout(&chain, &session, &"b".repeat(64), scope, op).await,
+            Err(AppError::Unavailable)
+        ));
+        protocol::logout(&chain, &session, &"b".repeat(64), scope, op)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn id_token_binds_opaque_public_session_and_refresh_cannot_replace_it() {
+    let mut state = state(vec![]);
+    let session = session(&state);
+    let now = Utc::now().timestamp();
+    let claims = json!({"iss":session.issuer,"aud":session.oidc_client_id,"sub":session.oidc_public_sub,
+        "sid":session.oidc_public_sid,"iat":now,"exp":now+300,"auth_time":session.auth_time,"nonce":"fixture-nonce"});
+    let tokens = |identity: String| json!({"access_token":"a".repeat(64),"refresh_token":"b".repeat(64),"token_type":"Bearer","scope":"openid profile","expires_in":300,"id_token":identity});
+    let script = |tokens: Value, with_userinfo: bool| {
+        let mut list = VecDeque::from([
+            (Endpoint::Discovery, 200, discovery()),
+            (Endpoint::Token, 200, tokens),
+            (Endpoint::Jwks, 200, crate::backchannel::tests::jwks()),
+            (Endpoint::AccountProof, 200, proof(&session)),
+        ]);
+        if with_userinfo {
+            list.push_back((
+                Endpoint::UserInfo,
+                200,
+                json!({"sub":session.oidc_public_sub}),
+            ));
+        }
+        list
+    };
+    let initial = script(
+        tokens(crate::backchannel::tests::signed_id_token(&claims)),
+        true,
+    );
+    state.transport = Arc::new(Script(Mutex::new(initial)));
+    let verified = protocol::exchange(
+        &Chain::new(&state).unwrap(),
+        "code",
+        "verifier",
+        &session.nonce_hash,
+    )
+    .await
+    .unwrap();
+    assert_eq!(verified.public_sid, session.oidc_public_sid);
+    let mut changed = claims.clone();
+    changed["sid"] = json!("9".repeat(64));
+    let retry = VecDeque::from([
+        (Endpoint::Discovery, 200, discovery()),
+        (
+            Endpoint::Token,
+            200,
+            tokens(crate::backchannel::tests::signed_id_token(&changed)),
+        ),
+        (Endpoint::Jwks, 200, crate::backchannel::tests::jwks()),
+        (Endpoint::AccountProof, 200, proof(&session)),
+    ]);
+    state.transport = Arc::new(Script(Mutex::new(retry)));
+    assert!(matches!(
+        protocol::refresh(&Chain::new(&state).unwrap(), &session, &"b".repeat(64)).await,
+        Err(AppError::Unauthorized(_))
+    ));
+    let mut missing = claims;
+    missing.as_object_mut().unwrap().remove("sid");
+    state.transport = Arc::new(Script(Mutex::new(VecDeque::from([
+        (Endpoint::Discovery, 200, discovery()),
+        (
+            Endpoint::Token,
+            200,
+            tokens(crate::backchannel::tests::signed_id_token(&missing)),
+        ),
+        (Endpoint::Jwks, 200, crate::backchannel::tests::jwks()),
+    ]))));
+    assert!(matches!(
+        protocol::exchange(
+            &Chain::new(&state).unwrap(),
+            "code",
+            "verifier",
+            &session.nonce_hash
+        )
+        .await,
+        Err(AppError::Unauthorized(_))
+    ));
 }
 
 mod pg;

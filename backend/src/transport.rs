@@ -9,9 +9,9 @@ pub(crate) enum Endpoint {
     Jwks,
     Token,
     UserInfo,
-    Introspect,
-    Revoke,
+    AccountProof,
     GlobalLogout,
+    LogoutOperation(uuid::Uuid),
     Memberships,
     Context,
     Profile,
@@ -21,23 +21,26 @@ pub(crate) enum Endpoint {
     SelectionResult,
 }
 impl Endpoint {
-    pub(crate) fn path(self) -> &'static str {
-        match self {
+    pub(crate) fn path(self) -> String {
+        let path = match self {
             Self::Discovery => "/.well-known/openid-configuration",
-            Self::Jwks => "/oidc/jwks",
-            Self::Token => "/oidc/token",
-            Self::UserInfo => "/oidc/userinfo",
-            Self::Introspect => "/oidc/introspect",
-            Self::Revoke => "/oidc/revoke",
-            Self::GlobalLogout => "/oidc/account/logout",
+            Self::Jwks => "/oauth/jwks",
+            Self::Token => "/oauth/token",
+            Self::UserInfo => "/oauth/userinfo",
+            Self::AccountProof => "/internal/identity/auth/customer-account-proof",
+            Self::GlobalLogout => "/oauth/logout",
+            Self::LogoutOperation(operation) => {
+                return format!("/oauth/logout/operations/{operation}")
+            }
             Self::Memberships => "/internal/customer-portal/memberships",
             Self::Context => "/internal/customer-portal/context",
             Self::Profile => "/internal/customer-portal/profile",
             Self::ContextRevoke => "/internal/customer-portal/revoke",
-            Self::ContextInteractions => "/oidc/context-interactions",
+            Self::ContextInteractions => "/internal/identity/auth/context-interactions",
             Self::SelectionConsume => "/internal/platform/context-selection/consume",
             Self::SelectionResult => "/internal/platform/context-selection/result",
-        }
+        };
+        path.to_owned()
     }
     fn resource(self) -> bool {
         matches!(
@@ -49,6 +52,9 @@ impl Endpoint {
                 | Self::SelectionConsume
                 | Self::SelectionResult
         )
+    }
+    fn private_identity(self) -> bool {
+        matches!(self, Self::AccountProof | Self::ContextInteractions)
     }
     fn post(self) -> bool {
         !matches!(self, Self::Discovery | Self::Jwks | Self::UserInfo)
@@ -72,15 +78,19 @@ pub(crate) trait OidcTransport: Send + Sync {
 struct HttpTransport {
     oidc: reqwest::Client,
     resource: reqwest::Client,
+    identity: reqwest::Client,
     issuer: String,
     resource_origin: String,
+    identity_origin: String,
 }
 pub(crate) fn configured(config: &Config) -> Arc<dyn OidcTransport> {
     Arc::new(HttpTransport {
         oidc: config.oidc_http.clone(),
         resource: config.resource_http.clone(),
+        identity: config.identity_http.clone(),
         issuer: config.issuer.clone(),
         resource_origin: config.resource_origin.clone(),
+        identity_origin: config.identity_origin.clone(),
     })
 }
 pub(crate) fn encode_form(parameters: &[(String, String)]) -> Result<String, AppError> {
@@ -96,6 +106,8 @@ impl OidcTransport for HttpTransport {
             let is_resource = request.endpoint.resource();
             let (client, origin) = if is_resource {
                 (&self.resource, &self.resource_origin)
+            } else if request.endpoint.private_identity() {
+                (&self.identity, &self.identity_origin)
             } else {
                 (&self.oidc, &self.issuer)
             };

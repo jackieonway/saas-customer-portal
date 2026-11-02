@@ -1,3 +1,4 @@
+/* global process, document, innerWidth, console */
 // Production bundle with explicit HTTP fixtures. This is a UI check, not HTTPS
 // federation acceptance. Reuse the workspace's installed browser test runtime.
 import assert from 'node:assert/strict'
@@ -15,7 +16,7 @@ const output = path.join(root, 'artifacts', 'centralized-selection')
 await mkdir(output, { recursive: true })
 const id = n => `019a1163-0000-7000-8000-${n.toString(16).padStart(12, '0')}`
 const account = { id: id(1), username: 'lin.yue', realName: '林悦', avatar: '' }
-const context = { contractVersion: 'customer-profile/1', purpose: 'CUSTOMER_PROFILE', userId: id(1), membershipId: id(2), memberType: 'CUSTOMER', identityVersion: '1', accountVersion: '0', tenant: { id: id(3), name: '青禾商贸' }, organization: { id: id(4), name: '华东服务中心' }, application: { id: id(5), code: 'customer-profile', name: '客户资料', entryPath: '/api/customer/profile' } }
+const context = { contractVersion: 'customer-profile/1', purpose: 'CUSTOMER_PROFILE', userId: id(1), membershipId: id(2), memberType: 'CUSTOMER', identityVersion: '1', accountVersion: '1', tenant: { id: id(3), name: '青禾商贸' }, organization: { id: id(4), name: '华东服务中心' }, application: { id: id(5), code: 'customer-profile', name: '客户资料', entryPath: '/api/customer/profile' } }
 const session = { contractVersion: 'portal-session/1', version: '2', csrfToken: 'c'.repeat(64), centralizedContextSelection: true, account,
   memberships: [{ membershipId: id(2), userId: id(1), memberType: 'CUSTOMER', identityVersion: '1', organizationId: id(4), organizationName: context.organization.name, tenantId: id(3), tenantName: context.tenant.name }], context }
 const posts = []
@@ -32,7 +33,7 @@ const server = createServer(async (req, res) => {
         let raw = ''; for await (const chunk of req) raw += chunk
         assert.equal(req.headers['x-csrf-token'], session.csrfToken)
         posts.push({ path: url.pathname, body: JSON.parse(raw) })
-        res.end(JSON.stringify({ redirectTo: 'https://auth.example.test/oidc/authorize' })); return
+        res.end(JSON.stringify({ redirectTo: 'https://auth.example.test/oauth/authorize' })); return
       }
       throw new Error('Unexpected local selection or credential endpoint')
     }
@@ -57,7 +58,7 @@ try {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
     await page.screenshot({ path: path.join(output, `${name}.png`), fullPage: true })
     await page.getByTestId('portal-central-switch').click()
-    await page.waitForURL('https://auth.example.test/oidc/authorize')
+    await page.waitForURL('https://auth.example.test/oauth/authorize')
     assert.deepEqual(posts.at(-1), { path: '/auth/login', body: { returnTo: '/', expectedVersion: '2' } })
     assert.deepEqual(errors, [])
     checks.push({ name, status: 'passed' })

@@ -90,7 +90,7 @@ CREATE TABLE public.portal_sessions (
     created_at timestamp with time zone NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     revoked_at timestamp with time zone,
-    CONSTRAINT portal_sessions_account_version_check CHECK ((account_version >= 0)),
+    CONSTRAINT portal_sessions_account_version_check CHECK ((account_version >= 1)),
     CONSTRAINT portal_sessions_auth_time_check CHECK ((auth_time > 0)),
     CONSTRAINT portal_sessions_browser_id_check CHECK (public.is_uuid_v7(browser_id)),
     CONSTRAINT portal_sessions_check CHECK ((expires_at > created_at)),
@@ -148,6 +148,45 @@ ALTER TABLE ONLY public.portal_login_flows
 
 ALTER TABLE ONLY public.portal_sessions
     ADD CONSTRAINT portal_sessions_browser_id_fkey FOREIGN KEY (browser_id) REFERENCES public.portal_browsers(id);
+
+ALTER TABLE public.portal_sessions
+    ADD COLUMN oidc_public_sid text NOT NULL CHECK (oidc_public_sid ~ '^[0-9a-f]{64}$'),
+    ADD COLUMN oidc_public_sub text NOT NULL CHECK (octet_length(oidc_public_sub) BETWEEN 1 AND 256 AND oidc_public_sub ~ '^[!-~]+$'),
+    ADD CONSTRAINT portal_logout_confirmation_binding CHECK (logout_confirmed_at IS NULL OR logout_request_id IS NOT NULL);
+CREATE FUNCTION public.portal_public_source_immutable() RETURNS trigger
+LANGUAGE plpgsql SET search_path TO pg_catalog,public AS $$
+BEGIN
+    IF (NEW.oidc_public_sid,NEW.oidc_public_sub) IS DISTINCT FROM (OLD.oidc_public_sid,OLD.oidc_public_sub) THEN
+        RAISE EXCEPTION 'PORTAL_PUBLIC_SOURCE_IMMUTABLE' USING ERRCODE='23514';
+    END IF;
+    IF (OLD.logout_request_id IS NOT NULL AND (NEW.logout_request_id,NEW.logout_scope) IS DISTINCT FROM (OLD.logout_request_id,OLD.logout_scope))
+       OR (OLD.logout_confirmed_at IS NOT NULL AND NEW.logout_confirmed_at IS DISTINCT FROM OLD.logout_confirmed_at) THEN
+        RAISE EXCEPTION 'PORTAL_LOGOUT_RECEIPT_IMMUTABLE' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER portal_public_source_immutable BEFORE UPDATE ON public.portal_sessions
+FOR EACH ROW EXECUTE FUNCTION public.portal_public_source_immutable();
+CREATE TABLE public.portal_backchannel_logout_receipts (
+    id uuid PRIMARY KEY CHECK (public.is_uuid_v7(id)),
+    issuer text NOT NULL CHECK (issuer ~ '^https://[^/?#[:space:]]+$'),
+    client_id uuid NOT NULL CHECK (public.is_uuid_v7(client_id)),
+    jti_digest text NOT NULL CHECK (jti_digest ~ '^[0-9a-f]{64}$'),
+    issued_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL CHECK (expires_at>issued_at),
+    received_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE(issuer,client_id,jti_digest)
+);
+CREATE INDEX portal_backchannel_logout_receipts_expiry ON public.portal_backchannel_logout_receipts(expires_at);
+CREATE TABLE public.portal_backchannel_logout_sources (
+    id uuid PRIMARY KEY CHECK (public.is_uuid_v7(id)),
+    issuer text NOT NULL CHECK (issuer ~ '^https://[^/?#[:space:]]+$'),
+    client_id uuid NOT NULL CHECK (public.is_uuid_v7(client_id)),
+    sid_digest text NOT NULL CHECK (sid_digest ~ '^[0-9a-f]{64}$'),
+    sub_digest text NOT NULL CHECK (sub_digest ~ '^[0-9a-f]{64}$'),
+    revoked_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE(issuer,client_id,sid_digest)
+);
 
 SET check_function_bodies = true;
 SELECT pg_catalog.set_config('search_path','public,pg_catalog,pg_temp',false);

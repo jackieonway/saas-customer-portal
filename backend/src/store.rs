@@ -22,6 +22,8 @@ pub(crate) struct Session {
     pub oidc_grant_id: Uuid,
     pub oidc_client_policy_version: i64,
     pub issuer: String,
+    pub oidc_public_sid: String,
+    pub oidc_public_sub: String,
     pub auth_time: i64,
     pub nonce_hash: String,
     pub access_ciphertext: String,
@@ -74,6 +76,36 @@ pub(crate) fn client(state: &AppState) -> Result<Uuid, AppError> {
 pub(crate) fn issuer(state: &AppState) -> Result<&str, AppError> {
     boundary::enabled(state)?;
     Ok(&state.config.issuer)
+}
+pub(crate) async fn lock_public_source(
+    connection: &mut sqlx::PgConnection,
+    issuer: &str,
+    client: Uuid,
+    sid: &str,
+) -> Result<(), AppError> {
+    if !crate::boundary::canonical_secret(sid) {
+        return Err(invalid());
+    }
+    let key = serde_json::json!(["oidc-rp-source/1", issuer, client.to_string(), sid]).to_string();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(key)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+pub(crate) async fn unrevoked_public_source(
+    connection: &mut sqlx::PgConnection,
+    issuer: &str,
+    client: Uuid,
+    sid: &str,
+) -> Result<(), AppError> {
+    lock_public_source(connection, issuer, client, sid).await?;
+    let revoked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM portal_backchannel_logout_sources WHERE issuer=$1 AND client_id=$2 AND sid_digest=$3)")
+        .bind(issuer).bind(client).bind(boundary::digest(sid)).fetch_one(connection).await?;
+    if revoked {
+        return Err(invalid());
+    }
+    Ok(())
 }
 pub(crate) async fn session_id<'e, E: Executor<'e, Database = Postgres>>(
     executor: E,
@@ -231,6 +263,11 @@ pub(crate) async fn commit_refresh(
     lease: Uuid,
     verified: &protocol::Verified,
 ) -> Result<Session, AppError> {
+    if verified.public_sid != original.oidc_public_sid
+        || verified.proof.subject != original.oidc_public_sub
+    {
+        return Err(invalid());
+    }
     let encrypted_access = keys(state)?.seal(
         original.id,
         &original.issuer,
@@ -245,7 +282,22 @@ pub(crate) async fn commit_refresh(
         "oidc-refresh",
         &verified.refresh,
     )?;
-    let changed:Option<Session>=sqlx::query_as("UPDATE portal_sessions s SET access_ciphertext=$3,refresh_ciphertext=$4,access_expires_at=$5,customer_needs_renewal=(membership_id IS NOT NULL),refresh_lease_id=NULL,refresh_started_at=NULL WHERE s.id=$1 AND s.refresh_lease_id=$2 AND NOT s.refresh_uncertain AND s.refresh_started_at>clock_timestamp()-interval '3 seconds' AND s.version=$6 AND s.revoked_at IS NULL AND s.logout_request_id IS NULL AND s.expires_at>clock_timestamp() AND $5::timestamptz>clock_timestamp() AND EXISTS(SELECT 1 FROM portal_browsers b WHERE b.id=s.browser_id AND b.current_session_id=s.id AND b.expires_at>clock_timestamp()) RETURNING s.*")
-        .bind(original.id).bind(lease).bind(encrypted_access).bind(encrypted_refresh).bind(verified.proof.expires_at).bind(original.version).fetch_optional(&state.pool).await?;
-    changed.ok_or_else(invalid)
+    let mut tx = state.pool.begin().await?;
+    unrevoked_public_source(
+        &mut tx,
+        &original.issuer,
+        original.oidc_client_id,
+        &original.oidc_public_sid,
+    )
+    .await?;
+    let changed:Option<Session>=sqlx::query_as("UPDATE portal_sessions s SET access_ciphertext=$3,refresh_ciphertext=$4,access_expires_at=$5,expires_at=LEAST(s.expires_at,$7),customer_needs_renewal=(membership_id IS NOT NULL),refresh_lease_id=NULL,refresh_started_at=NULL WHERE s.id=$1 AND s.refresh_lease_id=$2 AND NOT s.refresh_uncertain AND s.refresh_started_at>clock_timestamp()-interval '3 seconds' AND s.version=$6 AND s.revoked_at IS NULL AND s.logout_request_id IS NULL AND s.expires_at>clock_timestamp() AND $5::timestamptz>clock_timestamp() AND $5::timestamptz<=$7::timestamptz AND $7::timestamptz>clock_timestamp() AND EXISTS(SELECT 1 FROM portal_browsers b WHERE b.id=s.browser_id AND b.current_session_id=s.id AND b.expires_at>clock_timestamp()) RETURNING s.*")
+        .bind(original.id).bind(lease).bind(encrypted_access).bind(encrypted_refresh).bind(verified.proof.expires_at).bind(original.version).bind(verified.absolute_expires_at).fetch_optional(&mut *tx).await?;
+    let changed = changed.ok_or_else(invalid)?;
+    deadline(
+        &mut tx,
+        verified.proof.expires_at.min(verified.absolute_expires_at),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(changed)
 }

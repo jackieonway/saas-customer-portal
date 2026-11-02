@@ -11,6 +11,9 @@ pub(crate) struct Config {
     pub bind_addr: SocketAddr,
     pub public_origin: String,
     pub issuer: String,
+    pub identity_origin: String,
+    pub source_service_id: Uuid,
+    pub source_service_secret: String,
     pub client_id: Uuid,
     pub client_secret: String,
     pub redirect_uri: String,
@@ -19,6 +22,7 @@ pub(crate) struct Config {
     pub resource_client_secret: String,
     pub keys: Option<Arc<CipherKeys>>,
     pub oidc_http: reqwest::Client,
+    pub identity_http: reqwest::Client,
     pub resource_http: reqwest::Client,
 }
 
@@ -119,6 +123,25 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| "https://console.saas.test".into());
         origin(&resource_origin)?;
+        let identity_origin = if enabled {
+            required(values, "IDENTITY_SERVICE_URL")?.to_owned()
+        } else {
+            values
+                .get("IDENTITY_SERVICE_URL")
+                .cloned()
+                .unwrap_or_else(|| "https://identity-private.invalid".into())
+        };
+        origin(&identity_origin)?;
+        let source_service_id = if enabled {
+            id(required(values, "CUSTOMER_SOURCE_SERVICE_CLIENT_ID")?)
+                .map_err(|_| anyhow::anyhow!("customer source service must be canonical UUIDv7"))?
+        } else {
+            Uuid::nil()
+        };
+        let source_service_secret = values
+            .get("CUSTOMER_SOURCE_SERVICE_CLIENT_SECRET")
+            .cloned()
+            .unwrap_or_default();
         let redirect_uri = values
             .get("OIDC_REDIRECT_URI")
             .cloned()
@@ -152,7 +175,21 @@ impl Config {
             .unwrap_or_default();
         let keys = if enabled {
             secret(&client_secret)?;
+            anyhow::ensure!(
+                crate::boundary::canonical_secret(&client_secret),
+                "issued opaque OIDC client secret required"
+            );
             secret(&resource_client_secret)?;
+            anyhow::ensure!(
+                identity_origin != issuer
+                    && source_service_id != client_id
+                    && source_service_id.to_string() != resource_client_id
+                    && source_service_secret != client_secret
+                    && source_service_secret != resource_client_secret
+                    && crate::boundary::canonical_secret(&source_service_secret),
+                "independent private customer source service required"
+            );
+            required(values, "IDENTITY_SERVICE_CA_FILE")?;
             anyhow::ensure!(
                 !resource_client_id.is_empty()
                     && resource_client_id.len() <= 256
@@ -196,8 +233,10 @@ impl Config {
             anyhow::ensure!(
                 selection_client_id != client_id.to_string()
                     && selection_client_id != resource_client_id
+                    && selection_client_id != source_service_id.to_string()
                     && selection_client_secret != client_secret
                     && selection_client_secret != resource_client_secret
+                    && selection_client_secret != source_service_secret
                     && selection_client_secret.len() == 64
                     && selection_client_secret
                         .bytes()
@@ -219,6 +258,9 @@ impl Config {
             bind_addr,
             public_origin,
             issuer,
+            identity_origin,
+            source_service_id,
+            source_service_secret,
             client_id,
             client_secret,
             redirect_uri,
@@ -227,6 +269,7 @@ impl Config {
             resource_client_secret,
             keys,
             oidc_http: client(values, "OIDC_CA_FILE")?,
+            identity_http: client(values, "IDENTITY_SERVICE_CA_FILE")?,
             resource_http: client(values, "CUSTOMER_RESOURCE_CA_FILE")?,
         })
     }

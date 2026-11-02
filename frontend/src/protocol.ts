@@ -121,8 +121,7 @@ export function parseContext(value: unknown): CustomerContext {
     membershipId: id(source.membershipId),
     memberType: 'CUSTOMER',
     identityVersion: version(source.identityVersion),
-    // Accounts begin at generation zero; member and portal session versions begin at one.
-    accountVersion: version(source.accountVersion, true),
+    accountVersion: version(source.accountVersion),
     tenant: { id: id(tenant.id), name: text(tenant.name) },
     organization: { id: id(organization.id), name: text(organization.name) },
     application: {
@@ -186,7 +185,8 @@ export function parseProfile(value: unknown, session: PortalSession): Profile {
 export function parseRedirect(value: unknown): string {
   const source = record(value)
   const target = new URL(text(source.redirectTo))
-  if (target.protocol !== 'https:' || target.username || target.password || target.hash) throw new ProtocolError()
+  if (target.protocol !== 'https:' || target.username || target.password || target.hash
+    || target.pathname !== '/oauth/authorize') throw new ProtocolError()
   return target.href
 }
 

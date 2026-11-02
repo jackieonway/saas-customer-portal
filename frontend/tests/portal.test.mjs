@@ -93,17 +93,17 @@ test('centralized customer switch clears data, binds the original version and by
   const switching = h.controller.switchContext()
   assert.equal(h.controller.getSnapshot().profile, null)
   assert.equal(h.controller.getSnapshot().busy, true)
-  waiting.resolve('https://auth.owned.test/oidc/authorize')
+  waiting.resolve('https://auth.owned.test/oauth/authorize')
   await switching
-  assert.deepEqual(h.calls.navigation, ['https://auth.owned.test/oidc/authorize'])
+  assert.deepEqual(h.calls.navigation, ['https://auth.owned.test/oauth/authorize'])
   assert.deepEqual(h.calls.selection, [])
   assert.equal(h.calls.bootstrap, 0)
   await h.controller.reload()
   assert.equal(h.calls.broadcast.length, 1)
 })
 
-test('initial account generation zero completes explicit selection and self-profile transport', async () => {
-  const selected = session({ version: '2', context: { ...session().context, accountVersion: '0' } })
+test('initial account generation one completes explicit selection and self-profile transport', async () => {
+  const selected = session({ version: '2', context: { ...session().context, accountVersion: '1' } })
   const requests = []
   const api = createApi(async (path, init) => {
     requests.push({ path, init })
@@ -120,28 +120,28 @@ test('initial account generation zero completes explicit selection and self-prof
   await controller.select(ids.member)
   assert.equal(controller.getSnapshot().status, 'ready')
   assert.equal(controller.getSnapshot().session.version, '2')
-  assert.equal(controller.getSnapshot().profile.context.accountVersion, '0')
+  assert.equal(controller.getSnapshot().profile.context.accountVersion, '1')
   assert.deepEqual(requests.map(({ path }) => path), ['/auth/config', '/auth/session', '/auth/context', '/api/profile'])
   assert.deepEqual(JSON.parse(requests[2].init.body), { expectedVersion: '1', membershipId: ids.member })
   assert.deepEqual(broadcasts, [CHANGE_MESSAGE])
 })
 
-test('account generations accept canonical nonnegative i64 while session and identity generations remain positive', () => {
-  for (const accountVersion of ['0', '1', '9223372036854775807']) {
+test('account session and identity generations require canonical positive i64', () => {
+  for (const accountVersion of ['1', '2', '9223372036854775807']) {
     const value = session({ context: { ...session().context, accountVersion } })
     assert.equal(parseProfile(profile(value), parseSession(value)).context.accountVersion, accountVersion)
   }
-  for (const accountVersion of ['-1', '00', '01', '+0', ' 0', '0.0', 0, '9223372036854775808']) {
+  for (const accountVersion of ['0', '-1', '00', '01', '+0', ' 0', '0.0', 0, '9223372036854775808']) {
     assert.throws(() => parseSession(session({ context: { ...session().context, accountVersion } })), ProtocolError)
   }
   assert.throws(() => parseSession(session({ version: '0' })), ProtocolError)
   assert.throws(() => parseSession(session({ memberships: [member({ identityVersion: '0' })] })), ProtocolError)
 })
 
-test('self profile rejects a changed account generation after a zero-generation selection', () => {
-  const value = session({ context: { ...session().context, accountVersion: '0' } })
+test('self profile rejects a changed account generation after initial selection', () => {
+  const value = session({ context: { ...session().context, accountVersion: '1' } })
   const current = parseSession(value)
-  assert.throws(() => parseProfile({ ...profile(value), context: { ...value.context, accountVersion: '1' } }, current), ProtocolError)
+  assert.throws(() => parseProfile({ ...profile(value), context: { ...value.context, accountVersion: '2' } }, current), ProtocolError)
 })
 
 test('anonymous CSRF bootstrap has version zero and cannot carry identity or profile', () => {
@@ -181,7 +181,7 @@ test('profile cannot cross subject, account version, client application or profi
 
 test('only HTTPS login redirects without embedded credentials or fragments are allowed', () => {
   assert.equal(parseRedirect({ redirectTo: 'https://auth.owned.test/oauth/authorize?state=opaque' }), 'https://auth.owned.test/oauth/authorize?state=opaque')
-  for (const redirectTo of ['javascript:alert(1)', 'http://auth.owned.test/', 'https://user:pass@auth.owned.test/', 'https://auth.owned.test/#fragment']) {
+  for (const redirectTo of ['javascript:alert(1)', 'http://auth.owned.test/', 'https://user:pass@auth.owned.test/', 'https://auth.owned.test/#fragment', 'https://auth.owned.test/oidc/authorize', 'https://auth.owned.test/unregistered-login']) {
     assert.throws(() => parseRedirect({ redirectTo }))
   }
 })

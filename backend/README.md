@@ -24,10 +24,14 @@ constitute production registration.
 | `CUSTOMER_PORTAL_ENABLED` | Exact `true` or `false`; default `false` |
 | `PUBLIC_CUSTOMER_URL` | Exact HTTPS origin, e.g. `https://customer.saas.test` |
 | `OIDC_ISSUER` | Exact HTTPS issuer origin, e.g. `https://auth.saas.test`; a different hostname from the portal |
-| `OIDC_CLIENT_ID` | Canonical RFC UUID v7 of a confidential `CUSTOMER_PORTAL` client with exactly `['CUSTOMER']` |
-| `OIDC_CLIENT_SECRET` | Independently provisioned confidential RP secret, at least 32 characters |
+| `OIDC_CLIENT_ID` | Canonical UUIDv7 public ID of a unified CONFIDENTIAL / WEB_BFF / USER / PLATFORM_CONTEXT client with application purpose `CUSTOMER_PORTAL` and exactly `['CUSTOMER']` |
+| `OIDC_CLIENT_SECRET` | Issued RP secret: 64 lowercase hex characters, separate from every service/resource secret |
 | `OIDC_REDIRECT_URI` | Exactly `${PUBLIC_CUSTOMER_URL}/auth/callback` |
 | `OIDC_CA_FILE` | Optional absolute PEM CA bundle for the provider; normal hostname/chain validation remains enabled |
+| `IDENTITY_SERVICE_URL` | Exact private identity HTTPS origin, distinct from the public issuer; public gateways reject `/internal/*` |
+| `IDENTITY_SERVICE_CA_FILE` | Required absolute PEM CA bundle for that private identity connection; hostname/chain validation remains enabled |
+| `CUSTOMER_SOURCE_SERVICE_CLIENT_ID` | Canonical UUIDv7 of a dedicated `CONTEXT_SELECTION_SOURCE` service scoped only to this customer RP |
+| `CUSTOMER_SOURCE_SERVICE_CLIENT_SECRET` | Independent 64-character lowercase hex service secret; never reuse the platform source service, RP, resource or consumer credential |
 | `CUSTOMER_RESOURCE_URL` | Fixed private HTTPS platform resource origin, e.g. `https://platform-internal.saas.test`; the public console gateway rejects `/internal/*` |
 | `CUSTOMER_RESOURCE_CLIENT_ID` | Public ID of a separate confidential USER profile client registered to the CUSTOMER profile application |
 | `CUSTOMER_RESOURCE_CLIENT_SECRET` | Resource client's own secret; must differ from the RP secret |
@@ -57,8 +61,9 @@ credential, login query, cookie, private key or request body is logged.
 
 Create a new portal database using an operator-owned migration role, then run
 `cargo run --locked --bin portal-migrate` with its explicit `DATABASE_URL`.
-The migration creates only `portal_browsers`, `portal_login_flows` and
-`portal_sessions`, plus SQLx's migration history. All 16 UUID columns have an
+The migration creates only `portal_browsers`, `portal_login_flows`,
+`portal_sessions`, `portal_backchannel_logout_receipts` and
+`portal_backchannel_logout_sources`, plus SQLx's migration history. All 20 UUID columns have an
 individual validated RFC UUID v7 check and no UUID default. The database holds
 no authority replica and cannot create customer members.
 
@@ -84,8 +89,11 @@ for integration limits. Production enablement still requires the real HTTPS path
 and deployment-registration checks described there.
 
 Start `saas-customer-portal-backend` under a separate runtime role with only
-SELECT/INSERT/UPDATE/DELETE on those three portal tables and EXECUTE/USAGE as
-needed for their constraints. The HTTP server does not run migrations and
+SELECT/INSERT/UPDATE/DELETE on the three session/flow tables, SELECT/INSERT on
+the two back-channel receipt/source tables, and EXECUTE/USAGE as needed for constraints.
+The runtime cannot update or delete replay facts, own schema objects, inherit
+owner roles, or create schemas, tables, roles or temporary objects. The HTTP
+server verifies this schema/ACL contract before listening, does not run migrations and
 does not require migration history access, DDL, superuser privileges or access
 to the provider/platform databases. SIGTERM and Ctrl-C stop accepting requests,
 drain handlers and close the connection pool. `/health` returns only
@@ -134,11 +142,29 @@ snapshots. It never adopts a row reloaded after another tab's write.
 
 ## Provider and resource boundaries
 
-The provider uses only fixed discovery/JWKS/token/UserInfo/introspection/revoke
-endpoints. The RP validates exact discovery endpoint URLs, RS256, bounded RSA
-JWKS, issuer, canonical UUID v7 subject/sid, own audience, nonce, iat/exp,
-auth_time, own-client `oidc-account-proof/1`, exact purpose/type set, grant and
-account/client policy generations. UserInfo must have the same subject.
+The public provider uses fixed discovery and canonical `/oauth/*` endpoints.
+The RP requests only `openid profile` and online refresh; `offline_access` is
+not a business-context capability. It validates exact discovery endpoint URLs,
+RS256, bounded RSA JWKS, issuer, own audience, nonce, iat/exp and auth_time.
+ID Token and UserInfo subjects remain opaque strings and must agree with the
+private customer proof. The BFF never parses a pairwise subject as an internal
+UUID or requires an internal SSO session ID in a public ID Token.
+
+`POST /internal/identity/auth/customer-account-proof` is called only at
+`IDENTITY_SERVICE_URL`, using the independently registered customer source
+service. Its `customer-account-proof/1` response proves the exact CUSTOMER RP,
+`PLATFORM_CONTEXT`, `openid profile`, opaque subject, internal account and SSO
+session IDs, grant, original authentication time, account/client/application
+generations and access/absolute expiry. Employee, account-only, machine,
+wrong-client and revoked sources cannot establish a customer session. Context
+interaction creation also uses the private identity origin, authenticated by
+the RP credential for its own transaction.
+
+Authorization-code exchange requires a valid ID Token. Refresh may omit a new
+ID Token, and the original source is rechecked using the newly issued access
+proof. Refresh credentials go only to token/revoke endpoints; they are never
+introspected or used as an access proof. Introspection is a resource-consumer
+interface rather than the BFF's source of internal account IDs.
 
 All provider and resource HTTP for one browser operation shares a 3-second
 deadline, a 1-second connect timeout, and one of 16 non-queued concurrency
@@ -158,14 +184,47 @@ credential; the user can explicitly reconfirm via the independent bootstrap
 and an intact SSO session. Before rotation, the old opaque is revoked using
 its original still-live access proof. If both original access and opaque have
 already expired, they are non-authorizing and need no network revocation.
-After successful rotation, the exact original member and generation must get
+The original absolute deadline never increases; a shorter authority deadline
+shrinks the local session. After successful rotation, the exact original member and generation must get
 a new resource capability because its access-source expiry has changed.
 Neither refresh nor resource renewal can change or create a membership.
 
-`PORTAL` revokes only this RP grant; `GLOBAL` uses the provider's durable
-idempotent account logout command. A durable pending command pauses profile
-access, can be reconciled through `/auth/session`, and retains its original
-scope, grant and user. A later login is never cleared by an old logout.
+`PORTAL` maps to canonical `CURRENT_APP` and revokes only the original RP grant;
+`GLOBAL` also closes its original SSO source. Both commands use Basic-authenticated
+`POST /oauth/logout` with the original encrypted refresh, immutable public
+`sid`/`sub`, scope and durable operation ID. Recovery first queries
+`POST /oauth/logout/operations/{operationId}` with the same binding. Only an
+explicit `NOT_FOUND` permits submitting that same operation; unknown results
+never create a replacement ID. Consent is preserved by logout. The pending
+command pauses profile access and can reconcile after the original source was
+revoked. A later login is never cleared by an old logout or delayed response.
+
+The initial ID Token requires its opaque 64-character public RP `sid` and opaque
+`sub`; both are stored as immutable local source fields. A refresh ID Token must
+retain both; refresh without an ID Token retains the stored originals. These
+public fields never replace the separate private account/grant/SSO proof IDs.
+
+`POST /auth/backchannel-logout` accepts only a bounded form containing
+`logout_token`. It uses the configured issuer's fixed JWKS and validates RS256,
+`typ=logout+jwt`, exact issuer and single RP audience, UUIDv7 `jti`, matching
+`sid`/`sub`, the exact empty back-channel event and an original 120-second
+window. Future issuance is bounded by five seconds. Nonce, unknown or duplicate
+claims/fields and query credentials are rejected. This signed service request
+does not require a browser Cookie/CSRF or an already revoked access proof.
+
+A local transaction records the issuer/client/jti digest and timestamps, plus
+a durable sid/sub digest revocation fact even when the callback has not yet
+created a local session, then closes the exact original local source. Repeated `jti` returns
+`409 BACKCHANNEL_REPLAY`; a fresh delivery attempt for an already closed source
+acknowledges without further effects. A known sid with a different sub is
+rejected. Browser pointers are cleared only if they still point at the matching
+source. Receipt insertion and revocation both roll back if the original expiry
+passes while waiting for a lock. Callback and refresh commits acquire the same
+source advisory lock before browser/session row locks and reject an already
+recorded source. Thus a returned provider proof cannot insert or restore a
+session after its notification was acknowledged. The source fact outlives
+the individual notification's short signature window. No raw logout token or
+public sid/sub is logged.
 
 ## Verification
 
@@ -191,3 +250,10 @@ cookie. Tests use deterministic boundaries rather than timing sleeps. Actual
 shared-SSO/customer-only/profile/revocation browser acceptance is recorded by
 the current deployment validation report; compiling these tests does
 not itself claim that end-to-end acceptance.
+
+Phase 20 receiver/receipt regressions are explicitly executed using
+`cargo test --locked --lib tests::pg::phase20_ -- --ignored --test-threads=1`.
+They use the same owned-cluster guards and clean every fixture database. They
+exercise signed requests against the actual router and real local PostgreSQL,
+with an explicit JWKS transport fixture; this is distinct from the full
+identity/platform/portal HTTPS delivery acceptance maintained by the main task.

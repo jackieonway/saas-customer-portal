@@ -28,10 +28,10 @@ npm run dev
 | `GET /auth/login-bootstrap` | 仅在用户主动点击继续统一登录或重新确认账号时调用。旧 session Cookie 已失效时仍可返回匿名 `portal-session/1` 与独立 browser CSRF，不能用于普通加载时绕过失效会话。 |
 | `POST /auth/login` | 用户主动点击后通过 login-bootstrap 获取 browser CSRF，再提交 `{returnTo:"/"}`；仅接受 HTTPS 登录地址。 |
 | `POST /auth/context` | 只提交当前已登记客户成员的 ID 与 `expectedVersion`；结果必须仍属于原账号、精确选中成员且版本递增。 |
-| `GET /api/profile` | 沿用 `customer-profile/1` 的 `{context,account}`；必须匹配当前成员、账号、版本、租户、组织和应用。账号代次 `accountVersion` 是从 `"0"` 开始的规范非负 i64 字符串，成员与已登录门户会话版本仍从 `"1"` 开始。 |
+| `GET /api/profile` | 沿用 `customer-profile/1` 的 `{context,account}`；必须匹配当前成员、账号、版本、租户、组织和应用。账号代次 `accountVersion`、成员和已登录门户版本均为从 `"1"` 开始的规范正 i64 字符串；匿名会话版本仍为 `"0"`。 |
 | `POST /auth/logout` | 提交 `expectedVersion` 与 `PORTAL` 或 `GLOBAL`，只接受 `{redirectTo:"/signed-out"}`。 |
 
-全部请求携带同源 Cookie，禁止缓存和 HTTP 重定向跟随；全部 POST 携带 `X-CSRF-Token`，由后端同时核验精确 Origin。前端不会保存或发送 OIDC／平台访问或刷新凭据。CSRF token 仅保留于内存。没有浏览器持久存储。
+全部请求携带同源 Cookie，禁止缓存和 HTTP 重定向跟随；全部 POST 携带 `X-CSRF-Token`，由后端同时核验精确 Origin。登录跳转只接受 HTTPS canonical `/oauth/authorize`，拒绝旧认证入口。前端不会保存或发送 OIDC／平台访问或刷新凭据。CSRF token 仅保留于内存。没有浏览器持久存储。
 
 每次加载、切换、注销、跨页失效通知、隐藏页面和恢复焦点，先清除已有个人资料。Abort 与操作代次共同阻止迟到响应恢复旧身份。跨页通过门户专有 BroadcastChannel 发送严格的两字段变更通知，不发送账号、成员、资料或凭据，接收方重新请求服务器。
 
@@ -39,4 +39,4 @@ npm run dev
 
 ## 验证边界
 
-`npm test` 执行协议、传输和异步状态回归，包括组织／账号／版本混用、伪造成员、401／503、跨页注销、迟到响应、匿名 CSRF 和注销后的显式登录。真实 OIDC、Cookie、安全响应头、服务器权威状态以及同浏览器平台／门户隔离，由阶段 11 的真实端到端验收验证，不能由这些 Node 测试替代。
+`npm test` 执行协议、传输和异步状态回归，包括组织／账号／版本混用、伪造成员、401／503、跨页注销、迟到响应、匿名 CSRF 和注销后的显式登录。`tests/centralized-browser.mjs` 使用生产 bundle 与明确 HTTP fixtures 检查桌面及移动端切换；它不构成真实认证证据。统一认证 Phase 14 另外验收真实 HTTPS、Cookie、来源撤销、跨库结果恢复及同浏览器平台／门户隔离，不能由这些 Node 或浏览器 fixture 测试替代。

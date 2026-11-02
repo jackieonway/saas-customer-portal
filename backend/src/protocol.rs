@@ -12,10 +12,12 @@ use base64::{
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
 pub(crate) struct AccountProof {
+    pub subject: String,
     pub user_id: Uuid,
     pub global_session_id: Uuid,
     pub grant_id: Uuid,
@@ -24,8 +26,10 @@ pub(crate) struct AccountProof {
     pub client_policy_version: i64,
     pub auth_time: i64,
     pub expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
 }
 pub(crate) struct Verified {
+    pub public_sid: String,
     pub selection: Option<crate::selection::Extension>,
     pub proof: AccountProof,
     pub access: String,
@@ -34,14 +38,17 @@ pub(crate) struct Verified {
     pub id_expires_at: DateTime<Utc>,
 }
 struct Identity {
-    user_id: Uuid,
-    sid: Uuid,
+    subject: String,
+    public_sid: String,
     auth_time: i64,
     expires_at: DateTime<Utc>,
 }
 
 fn invalid() -> AppError {
     AppError::unauthorized("OIDC 认证响应无效，请重新登录")
+}
+pub(crate) fn opaque(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 fn object(value: &Value) -> Result<&serde_json::Map<String, Value>, AppError> {
     value.as_object().ok_or_else(invalid)
@@ -73,6 +80,9 @@ fn json(response: OidcResponse) -> Result<Value, AppError> {
     }
     let value: Value = serde_json::from_slice(&response.body).map_err(|_| AppError::Unavailable)?;
     if response.status != 200 {
+        if response.status == 401 && value.get("error").is_none() {
+            return Err(invalid());
+        }
         return Err(match value.get("error").and_then(Value::as_str) {
             Some("invalid_grant" | "invalid_token" | "access_denied") => invalid(),
             _ => AppError::Unavailable,
@@ -87,6 +97,19 @@ fn basic(chain: &Chain<'_>) -> Result<String, AppError> {
     Ok(format!(
         "Basic {}",
         STANDARD.encode(format!("{client}:{secret}"))
+    ))
+}
+fn source_basic(chain: &Chain<'_>) -> Result<String, AppError> {
+    let config = &chain.state.config;
+    if !crate::boundary::canonical_secret(&config.source_service_secret) {
+        return Err(AppError::Unavailable);
+    }
+    Ok(format!(
+        "Basic {}",
+        STANDARD.encode(format!(
+            "{}:{}",
+            config.source_service_id, config.source_service_secret
+        ))
     ))
 }
 async fn call(
@@ -114,12 +137,12 @@ pub(crate) async fn discovery(chain: &Chain<'_>) -> Result<(), AppError> {
         return Err(AppError::Unavailable);
     }
     for (name, endpoint) in [
-        ("authorization_endpoint", "/oidc/authorize"),
-        ("token_endpoint", "/oidc/token"),
-        ("jwks_uri", "/oidc/jwks"),
-        ("userinfo_endpoint", "/oidc/userinfo"),
-        ("introspection_endpoint", "/oidc/introspect"),
-        ("revocation_endpoint", "/oidc/revoke"),
+        ("authorization_endpoint", "/oauth/authorize"),
+        ("token_endpoint", "/oauth/token"),
+        ("jwks_uri", "/oauth/jwks"),
+        ("userinfo_endpoint", "/oauth/userinfo"),
+        ("introspection_endpoint", "/oauth/introspect"),
+        ("revocation_endpoint", "/oauth/revoke"),
     ] {
         if document.get(name).and_then(Value::as_str)
             != Some(format!("{issuer}{endpoint}").as_str())
@@ -147,7 +170,7 @@ pub(crate) async fn discovery(chain: &Chain<'_>) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn identity(chain: &Chain<'_>, token: &str, nonce_hash: &str) -> Result<Identity, AppError> {
+pub(crate) async fn signing_key(chain: &Chain<'_>, token: &str) -> Result<DecodingKey, AppError> {
     if token.len() > 16384 {
         return Err(invalid());
     }
@@ -209,7 +232,15 @@ async fn identity(chain: &Chain<'_>, token: &str, nonce_hash: &str) -> Result<Id
     {
         return Err(invalid());
     }
-    let decoding = DecodingKey::from_rsa_components(n, "AQAB").map_err(|_| invalid())?;
+    DecodingKey::from_rsa_components(n, "AQAB").map_err(|_| invalid())
+}
+
+async fn identity(chain: &Chain<'_>, token: &str, nonce_hash: &str) -> Result<Identity, AppError> {
+    let header = jsonwebtoken::decode_header(token).map_err(|_| invalid())?;
+    if header.typ.as_deref() != Some("JWT") {
+        return Err(invalid());
+    }
+    let decoding = signing_key(chain, token).await?;
     let client = store::client(chain.state)?.to_string();
     let issuer = store::issuer(chain.state)?;
     let mut validation = Validation::new(Algorithm::RS256);
@@ -219,12 +250,12 @@ async fn identity(chain: &Chain<'_>, token: &str, nonce_hash: &str) -> Result<Id
     validation.set_required_spec_claims(&[
         "iss",
         "sub",
+        "sid",
         "aud",
         "exp",
         "iat",
         "nonce",
         "auth_time",
-        "sid",
     ]);
     let claims = jsonwebtoken::decode::<Value>(token, &decoding, &validation)
         .map_err(|_| invalid())?
@@ -257,59 +288,93 @@ async fn identity(chain: &Chain<'_>, token: &str, nonce_hash: &str) -> Result<Id
         return Err(invalid());
     }
     let expires_at = DateTime::from_timestamp(exp, 0).ok_or_else(invalid)?;
+    let subject = text(&claims, "sub")?;
+    let public_sid = text(&claims, "sid")?;
+    if !opaque(subject) || !crate::boundary::canonical_secret(public_sid) {
+        return Err(invalid());
+    }
     Ok(Identity {
-        user_id: id(text(&claims, "sub")?)?,
-        sid: id(text(&claims, "sid")?)?,
+        subject: subject.to_owned(),
+        public_sid: public_sid.to_owned(),
         auth_time,
         expires_at,
     })
 }
 
 async fn inspect(chain: &Chain<'_>, token: &str) -> Result<AccountProof, AppError> {
-    let value = call(
-        chain,
-        Endpoint::Introspect,
-        Some(basic(chain)?),
-        vec![("token".into(), token.into())],
-    )
-    .await?;
-    if value.get("active").and_then(Value::as_bool) != Some(true) {
+    if !crate::boundary::canonical_secret(token) {
         return Err(invalid());
     }
+    let value = json(
+        chain
+            .send(OidcRequest {
+                endpoint: Endpoint::AccountProof,
+                authorization: Some(source_basic(chain)?),
+                form: vec![],
+                json: Some(
+                    serde_json::json!({"contractVersion":"customer-account-proof-request/1",
+            "expectedClientId":store::client(chain.state)?,"oidcAccessToken":token}),
+                ),
+            })
+            .await?,
+    )?;
     let client = store::client(chain.state)?;
-    if text(&value, "client_id")? != client.to_string()
-        || text(&value, "aud")? != client.to_string()
-        || text(&value, "iss")? != store::issuer(chain.state)?
-        || text(&value, "token_type")? != "Bearer"
-        || !text(&value, "scope")?
-            .split_whitespace()
-            .any(|scope| scope == "openid")
+    if text(&value, "contractVersion")? != "customer-account-proof/1"
+        || text(&value, "clientId")? != client.to_string()
+        || text(&value, "issuer")? != store::issuer(chain.state)?
+        || text(&value, "clientPurpose")? != "CUSTOMER_PORTAL"
+        || text(&value, "contextMode")? != "PLATFORM_CONTEXT"
+        || value.get("allowedMemberTypes") != Some(&serde_json::json!(["CUSTOMER"]))
+        || value
+            .get("scope")
+            .and_then(Value::as_array)
+            .is_none_or(|scopes| {
+                scopes.len() != 2
+                    || !["openid", "profile"]
+                        .iter()
+                        .all(|required| scopes.iter().any(|scope| scope.as_str() == Some(required)))
+            })
     {
         return Err(invalid());
     }
-    let projection = value.get("accountProof").ok_or_else(invalid)?;
-    if text(projection, "contractVersion")? != "oidc-account-proof/1"
-        || text(projection, "clientPurpose")? != "CUSTOMER_PORTAL"
-        || projection.get("allowedMemberTypes") != Some(&serde_json::json!(["CUSTOMER"]))
+    let subject = text(&value, "sub")?;
+    let auth_time = number(&value, "authTime")?;
+    let now = Utc::now();
+    if subject.is_empty()
+        || subject.len() > 256
+        || subject.chars().any(char::is_control)
+        || auth_time <= 0
+        || auth_time > now.timestamp() + 60
     {
         return Err(invalid());
     }
-    let expires_at = DateTime::from_timestamp(number(&value, "exp")?, 0)
-        .filter(|expires| *expires > Utc::now())
+    let expires_at = DateTime::parse_from_rfc3339(text(&value, "expiresAt")?)
+        .map(|value| value.with_timezone(&Utc))
+        .ok()
+        .filter(|expires| *expires > now)
         .ok_or_else(invalid)?;
+    let absolute_expires_at = DateTime::parse_from_rfc3339(text(&value, "absoluteExpiresAt")?)
+        .map(|value| value.with_timezone(&Utc))
+        .ok()
+        .filter(|expires| *expires >= expires_at)
+        .ok_or_else(invalid)?;
+    generation(text(&value, "applicationProjectionVersion")?, 1)?;
     Ok(AccountProof {
-        user_id: id(text(&value, "sub")?)?,
-        global_session_id: id(text(&value, "sid")?)?,
-        grant_id: id(text(projection, "grantId")?)?,
-        account_version: generation(text(projection, "accountVersion")?, 0)?,
+        subject: subject.to_owned(),
+        user_id: id(text(&value, "userId")?)?,
+        global_session_id: id(text(&value, "globalSessionId")?)?,
+        grant_id: id(text(&value, "grantId")?)?,
+        account_version: generation(text(&value, "accountVersion")?, 1)?,
         client_id: client,
-        client_policy_version: generation(text(projection, "clientPolicyVersion")?, 1)?,
-        auth_time: number(projection, "authTime")?,
+        client_policy_version: generation(text(&value, "clientPolicyVersion")?, 1)?,
+        auth_time,
         expires_at,
+        absolute_expires_at,
     })
 }
 fn same(proof: &AccountProof, session: &store::Session) -> Result<(), AppError> {
-    if proof.user_id != session.user_id
+    if proof.subject != session.oidc_public_sub
+        || proof.user_id != session.user_id
         || proof.global_session_id != session.global_session_id
         || proof.grant_id != session.oidc_grant_id
         || proof.account_version != session.account_version
@@ -321,7 +386,7 @@ fn same(proof: &AccountProof, session: &store::Session) -> Result<(), AppError> 
     }
     Ok(())
 }
-async fn userinfo(chain: &Chain<'_>, access: &str, user: Uuid) -> Result<(), AppError> {
+async fn userinfo(chain: &Chain<'_>, access: &str, subject: &str) -> Result<(), AppError> {
     let value = call(
         chain,
         Endpoint::UserInfo,
@@ -329,7 +394,7 @@ async fn userinfo(chain: &Chain<'_>, access: &str, user: Uuid) -> Result<(), App
         vec![],
     )
     .await?;
-    if id(text(&value, "sub")?)? != user {
+    if text(&value, "sub")? != subject {
         return Err(invalid());
     }
     Ok(())
@@ -341,7 +406,7 @@ pub(crate) async fn existing(
 ) -> Result<AccountProof, AppError> {
     let proof = inspect(chain, access).await?;
     same(&proof, session)?;
-    userinfo(chain, access, session.user_id).await?;
+    userinfo(chain, access, &proof.subject).await?;
     Ok(proof)
 }
 
@@ -361,34 +426,50 @@ async fn verified(
         return Err(invalid());
     }
     let scopes = text(&response, "scope")?;
-    if ["openid", "profile", "offline_access"]
+    if ["openid", "profile"]
         .iter()
         .any(|required| !scopes.split_whitespace().any(|scope| scope == *required))
+        || scopes.split_whitespace().count() != 2
     {
         return Err(invalid());
     }
-    let identity = identity(chain, text(&response, "id_token")?, nonce_hash).await?;
+    let identity = match response.get("id_token") {
+        Some(value) => {
+            Some(identity(chain, value.as_str().ok_or_else(invalid)?, nonce_hash).await?)
+        }
+        None => None,
+    };
+    if original.is_none() && identity.is_none() {
+        return Err(invalid());
+    }
     let mut proof = inspect(chain, &access).await?;
-    let refresh_proof = inspect(chain, &refresh).await?;
-    if identity.user_id != proof.user_id
-        || identity.sid != proof.global_session_id
-        || identity.auth_time != proof.auth_time
-        || refresh_proof.user_id != proof.user_id
-        || refresh_proof.global_session_id != proof.global_session_id
-        || refresh_proof.grant_id != proof.grant_id
-        || refresh_proof.account_version != proof.account_version
-        || refresh_proof.client_policy_version != proof.client_policy_version
-        || refresh_proof.auth_time != proof.auth_time
-        || refresh_proof.expires_at < proof.expires_at
-    {
+    if identity.as_ref().is_some_and(|identity| {
+        identity.subject != proof.subject || identity.auth_time != proof.auth_time
+    }) {
         return Err(invalid());
     }
     if let Some(original) = original {
         same(&proof, original)?;
+        if identity.as_ref().is_some_and(|identity| {
+            identity.public_sid != original.oidc_public_sid
+                || identity.subject != original.oidc_public_sub
+        }) {
+            return Err(invalid());
+        }
     }
-    userinfo(chain, &access, proof.user_id).await?;
-    proof.expires_at = proof.expires_at.min(identity.expires_at);
+    userinfo(chain, &access, &proof.subject).await?;
+    let public_sid = identity
+        .as_ref()
+        .map(|identity| identity.public_sid.clone())
+        .or_else(|| original.map(|session| session.oidc_public_sid.clone()))
+        .ok_or_else(invalid)?;
+    let id_expires_at = identity
+        .map(|identity| identity.expires_at)
+        .unwrap_or(proof.expires_at);
+    proof.expires_at = proof.expires_at.min(id_expires_at);
+    let absolute_expires_at = proof.absolute_expires_at;
     Ok(Verified {
+        public_sid,
         selection: if original.is_none() {
             response
                 .get("context_selection")
@@ -403,8 +484,8 @@ async fn verified(
         proof,
         access,
         refresh,
-        absolute_expires_at: refresh_proof.expires_at,
-        id_expires_at: identity.expires_at,
+        absolute_expires_at,
+        id_expires_at,
     })
 }
 
@@ -435,10 +516,8 @@ pub(crate) async fn refresh(
     original: &store::Session,
     refresh: &str,
 ) -> Result<Verified, AppError> {
-    // The still-live refresh credential is an online deny-only source proof.
-    // An expired access token cannot authorize a request or justify a retry.
-    let before = inspect(chain, refresh).await?;
-    same(&before, original)?;
+    // Only the token endpoint consumes a refresh credential. Its atomic family
+    // rotation rechecks the original source; private proofs accept access only.
     discovery(chain).await?;
     let value = call(
         chain,
@@ -464,25 +543,66 @@ pub(crate) async fn logout(
     {
         return Err(invalid());
     }
-    let endpoint = if scope == "GLOBAL" {
-        Endpoint::GlobalLogout
-    } else {
-        Endpoint::Revoke
+    let scope = match scope {
+        "GLOBAL" => "GLOBAL",
+        "PORTAL" => "CURRENT_APP",
+        _ => return Err(invalid()),
     };
-    let mut form = vec![("token".into(), refresh.into())];
-    if scope == "GLOBAL" {
-        form.push(("request_id".into(), request.to_string()));
+    if !crate::boundary::canonical_secret(&session.oidc_public_sid)
+        || !opaque(&session.oidc_public_sub)
+    {
+        return Err(invalid());
     }
-    let response = chain
+    let form = vec![
+        ("token".into(), refresh.into()),
+        ("scope".into(), scope.into()),
+        ("operation_id".into(), request.to_string()),
+        ("sid".into(), session.oidc_public_sid.clone()),
+        ("sub".into(), session.oidc_public_sub.clone()),
+    ];
+    // The original refresh can already be revoked or expired. Recovery proves
+    // the caller's exact original binding without re-authorizing a new grant.
+    let recovered = chain
         .send(OidcRequest {
             json: None,
-            endpoint,
+            endpoint: Endpoint::LogoutOperation(request),
             authorization: Some(basic(chain)?),
-            form,
+            form: form.clone(),
         })
         .await?;
+    let response = if recovered.status == 404 {
+        let missing: Value =
+            serde_json::from_slice(&recovered.body).map_err(|_| AppError::Unavailable)?;
+        if missing.get("code").and_then(Value::as_str) != Some("NOT_FOUND") {
+            return Err(AppError::Unavailable);
+        }
+        chain
+            .send(OidcRequest {
+                json: None,
+                endpoint: Endpoint::GlobalLogout,
+                authorization: Some(basic(chain)?),
+                form,
+            })
+            .await?
+    } else {
+        recovered
+    };
     if response.status != 200 {
         json(response)?;
+        return Err(AppError::Unavailable);
+    }
+    if response.body.len() > 65536 {
+        return Err(AppError::Unavailable);
+    }
+    let completed: LogoutReceipt =
+        serde_json::from_slice(&response.body).map_err(|_| AppError::Unavailable)?;
+    if completed.operation_id != request.to_string()
+        || completed.scope != scope
+        || completed.state != "COMPLETED"
+        || completed.revoked_grant_count < 0
+        || completed.revoked_sso_count < 0
+        || completed.notification_count < 0
+    {
         return Err(AppError::Unavailable);
     }
     // Keep the original caller-owned identity in this command; never derive a
@@ -491,4 +611,15 @@ pub(crate) async fn logout(
         return Err(invalid());
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LogoutReceipt {
+    operation_id: String,
+    scope: String,
+    state: String,
+    revoked_grant_count: i64,
+    revoked_sso_count: i64,
+    notification_count: i64,
 }

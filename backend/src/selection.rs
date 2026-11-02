@@ -51,6 +51,14 @@ pub(crate) async fn create(
         return Err(AppError::Unavailable);
     }
     let value: Value = serde_json::from_slice(&response.body).map_err(|_| AppError::Unavailable)?;
+    let expires = value["expiresAt"]
+        .as_str()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .ok_or(AppError::Unavailable)?;
+    if value["contractVersion"] != "context-selection/1" || expires <= chrono::Utc::now() {
+        return Err(AppError::Unavailable);
+    }
     let reference = value["contextRequest"]
         .as_str()
         .filter(|s| b::canonical_secret(s))
@@ -149,7 +157,7 @@ pub(crate) async fn resume(
         "customer-context",
         &issued.customer_context,
     )?;
-    let current:Option<store::Session>=sqlx::query_as("UPDATE portal_sessions s SET membership_id=$4,organization_id=$5,identity_version=$6,customer_ciphertext=$7,customer_expires_at=$8,customer_needs_renewal=false,pending_selection_ciphertext=NULL WHERE s.id=$1 AND s.version=$2 AND s.pending_selection_ciphertext=$3 AND s.access_ciphertext=$9 AND s.revoked_at IS NULL AND s.expires_at>clock_timestamp() AND s.logout_request_id IS NULL AND s.refresh_lease_id IS NULL AND NOT s.refresh_uncertain AND EXISTS(SELECT 1 FROM portal_browsers b WHERE b.id=s.browser_id AND b.current_session_id=s.id AND b.expires_at>clock_timestamp()) RETURNING s.*")
+    let current:Option<store::Session>=sqlx::query_as("UPDATE portal_sessions s SET membership_id=$4,organization_id=$5,identity_version=$6,customer_ciphertext=$7,customer_expires_at=$8,customer_needs_renewal=false,pending_selection_ciphertext=NULL WHERE s.id=$1 AND s.version=$2 AND s.pending_selection_ciphertext=$3 AND s.access_ciphertext=$9 AND s.revoked_at IS NULL AND s.expires_at>clock_timestamp() AND s.access_expires_at>clock_timestamp() AND $8::timestamptz>clock_timestamp() AND s.logout_request_id IS NULL AND s.refresh_lease_id IS NULL AND NOT s.refresh_uncertain AND EXISTS(SELECT 1 FROM portal_browsers b WHERE b.id=s.browser_id AND b.current_session_id=s.id AND b.expires_at>clock_timestamp()) RETURNING s.*")
         .bind(s.id).bind(s.version).bind(encrypted).bind(m.membership_id).bind(m.organization_id).bind(identity_version).bind(context).bind(issued.expires_at).bind(&s.access_ciphertext).fetch_optional(&state.pool).await?;
     current.ok_or_else(|| AppError::conflict("其他门户操作已完成，请重新检查"))
 }

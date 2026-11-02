@@ -30,6 +30,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/auth/callback", get(callback))
         .route("/auth/context", post(context))
         .route("/auth/logout", post(logout))
+        .route(
+            "/auth/backchannel-logout",
+            post(crate::backchannel::endpoint),
+        )
         .route("/api/profile", get(profile))
         .layer(DefaultBodyLimit::max(8192))
         .layer(middleware::from_fn(protected_headers))
@@ -88,7 +92,10 @@ async fn authenticated(state: &AppState, headers: &HeaderMap) -> Result<store::S
     }
     // Confirmed logout can be replayed as a receipt, although its browser no
     // longer points at the retired session. Other paths call store::online.
-    if browser.current_session_id != Some(s.id) && s.logout_confirmed_at.is_none() {
+    if browser.current_session_id != Some(s.id)
+        && s.logout_confirmed_at.is_none()
+        && s.logout_request_id.is_none()
+    {
         return Err(invalid());
     }
     Ok(s)
@@ -239,13 +246,13 @@ async fn login(
         .bind(flow_id).bind(browser.id).bind(browser.generation).bind(b::digest(&state_secret)).bind(b::digest(&binder)).bind(b::digest(&nonce)).bind(encrypted).bind(path).execute(&mut *tx).await?;
     sqlx::query("UPDATE portal_login_flows SET context_selection_required=$2,switch_session_id=$3,switch_version=$4 WHERE id=$1").bind(flow_id).bind(state.config.context_selection_enabled).bind(switching.as_ref().map(|s|s.id)).bind(switching.as_ref().map(|s|s.version)).execute(&mut *tx).await?;
     tx.commit().await?;
-    let mut url = reqwest::Url::parse(&format!("{}/oidc/authorize", state.config.issuer))
+    let mut url = reqwest::Url::parse(&format!("{}/oauth/authorize", state.config.issuer))
         .map_err(|_| AppError::Unavailable)?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &state.config.client_id.to_string())
         .append_pair("redirect_uri", &state.config.redirect_uri)
-        .append_pair("scope", "openid profile offline_access")
+        .append_pair("scope", "openid profile")
         .append_pair("state", &state_secret)
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge_method", "S256")
@@ -358,6 +365,13 @@ async fn callback(
         &verified.refresh,
     )?;
     let mut tx = state.pool.begin().await?;
+    store::unrevoked_public_source(
+        &mut tx,
+        &state.config.issuer,
+        state.config.client_id,
+        &verified.public_sid,
+    )
+    .await?;
     let current = store::browser(&mut *tx, &b::digest(browser_cookie), true)
         .await?
         .ok_or_else(invalid)?;
@@ -395,9 +409,9 @@ async fn callback(
     .bind(current.id)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO portal_sessions(id,browser_id,token_hash,user_id,account_version,global_session_id,oidc_client_id,oidc_grant_id,oidc_client_policy_version,issuer,auth_time,nonce_hash,access_ciphertext,refresh_ciphertext,access_expires_at,version,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$17,clock_timestamp(),$16)")
+    sqlx::query("INSERT INTO portal_sessions(id,browser_id,token_hash,user_id,account_version,global_session_id,oidc_client_id,oidc_grant_id,oidc_client_policy_version,issuer,auth_time,nonce_hash,access_ciphertext,refresh_ciphertext,access_expires_at,version,created_at,expires_at,oidc_public_sid,oidc_public_sub) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$17,clock_timestamp(),$16,$18,$19)")
         .bind(id).bind(current.id).bind(b::digest(&cookie)).bind(verified.proof.user_id).bind(verified.proof.account_version).bind(verified.proof.global_session_id).bind(state.config.client_id)
-        .bind(verified.proof.grant_id).bind(verified.proof.client_policy_version).bind(&state.config.issuer).bind(verified.proof.auth_time).bind(&flow.nonce_hash).bind(access).bind(refresh).bind(verified.proof.expires_at).bind(verified.absolute_expires_at).bind(version).execute(&mut *tx).await?;
+        .bind(verified.proof.grant_id).bind(verified.proof.client_policy_version).bind(&state.config.issuer).bind(verified.proof.auth_time).bind(&flow.nonce_hash).bind(access).bind(refresh).bind(verified.proof.expires_at).bind(verified.absolute_expires_at).bind(version).bind(&verified.public_sid).bind(&verified.proof.subject).execute(&mut *tx).await?;
     sqlx::query("UPDATE portal_sessions SET pending_selection_ciphertext=$2 WHERE id=$1")
         .bind(id)
         .bind(pending)

@@ -1,6 +1,7 @@
 //! Independent customer relying party. Only cookie-bound, exact CUSTOMER
 //! selection reaches the self-profile resource; this crate has no platform DB.
 
+mod backchannel;
 mod boundary;
 mod config;
 mod crypto;
@@ -8,6 +9,7 @@ mod error;
 mod protocol;
 mod resource;
 mod routes;
+mod schema_readiness;
 mod selection;
 mod store;
 mod transport;
@@ -46,6 +48,7 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("portal database unavailable"))?;
     let bind = config.bind_addr;
+    schema_readiness::verify(&pool).await?;
     let state = AppState {
         transport: transport::configured(&config),
         config: Arc::new(config),
