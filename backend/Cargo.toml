@@ -27,4 +27,13 @@ uuid = { version = "=1.26.1", features = ["v7", "serde"] }
 tower = { version = "=0.5.3", features = ["util"] }
 
 [profile.dev]
+incremental = false
 debug = 1
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.release]
+strip = "debuginfo"
+debug = 0
